@@ -1,0 +1,34 @@
+{
+  // Python settings
+  "python.defaultInterpreterPath": "/usr/bin/python3",
+  "python.analysis.autoSearchPaths": true,
+  "python.linting.enabled": true,
+  "python.linting.pylintEnabled": false,
+  "python.linting.flake8Enabled": true,
+  "python.formatting.provider": "black",
+  
+  // Java settings
+  "java.configuration.updateBuildConfiguration": "automatic",
+  "java.compile.nullAnalysis.mode": "automatic",
+  
+  // File associations
+  "files.associations": {
+    "docker-compose*.yml": "dockercompose",
+    "*.env": "properties"
+  },
+  
+  // Editor
+  "editor.formatOnSave": true,
+  "editor.rulers": [120],
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  
+  // Hide clutter
+  "files.exclude": {
+    "**/.git": true,
+    "**/__pycache__": true,
+    "**/*.pyc": true,
+    "**/node_modules": true,
+    "**/target": true
+  }
+}

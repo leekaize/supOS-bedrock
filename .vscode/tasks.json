@@ -1,0 +1,43 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "View Orchestrator Logs",
+      "type": "shell",
+      "command": "docker logs -f supos-orchestrator",
+      "isBackground": true,
+      "problemMatcher": {
+        "pattern": {
+          "regexp": "^$",
+          "file": 1,
+          "location": 2,
+          "message": 3
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": ".*",
+          "endsPattern": "^$"
+        }
+      }
+    },
+    {
+      "label": "Rebuild Orchestrator",
+      "type": "shell",
+      "command": "docker build -t leekaize/supos-bedrock:latest .",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Install supOS",
+      "type": "shell",
+      "command": "docker run -d --name supos-bedrock --restart always -p 8080:8080 -v /var/run/docker.sock:/var/run/docker.sock -v /volumes/supos/data:/volumes/supos/data -e HOST_IPS=\"$(hostname -I)\" leekaize/supos-bedrock:latest",
+      "problemMatcher": []
+    },
+    {
+      "label": "Uninstall supOS",
+      "type": "shell",
+      "command": "docker stop supos-bedrock && docker rm supos-bedrock && bash ${workspaceFolder}/bin/clean-all.sh",
+      "problemMatcher": []
+    }
+  ]
+}

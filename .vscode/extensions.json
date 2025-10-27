@@ -1,0 +1,16 @@
+{
+  "recommendations": [
+    // Remote Development
+    "jeanp413.open-remote-ssh",
+    // Docker
+    "ms-azuretools.vscode-docker",
+    "ms-azuretools.vscode-containers",
+    // Python (for orchestrator)
+    "ms-python.python",
+    "ms-python.debugpy",
+    // Utilities
+    "editorconfig.editorconfig",
+    "redhat.vscode-yaml"
+  ],
+  "unwantedRecommendations": []
+}

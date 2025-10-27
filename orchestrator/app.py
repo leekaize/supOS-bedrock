@@ -24,12 +24,78 @@ INSTALL_LOG = os.path.join(LOG_DIR, 'install.log')
 
 client = docker.from_env()
 
+# ========== Detect IPs ==========
+@app.route('/api/config/detected-ips', methods=['GET'])
+def get_detected_ips():
+    """
+    Returns all IPs from HOST_IPS env var.
+    User runs: docker run -e HOST_IPS=$(hostname -I) ...
+    Returns space-separated IPs as array.
+    """
+    try:
+        # Read from environment variable (space-separated)
+        host_ips_raw = os.environ.get('HOST_IPS', '').strip()
+
+        # Parse space-separated IPs
+        if host_ips_raw:
+            detected_ips = host_ips_raw.split()
+        else:
+            detected_ips = []
+
+        # Always include localhost as option
+        if '127.0.0.1' not in detected_ips:
+            detected_ips.insert(0, '127.0.0.1')
+
+        return jsonify({
+            'detected_ips': detected_ips,
+            'default_port': '8088'
+        })
+
+    except Exception as e:
+        return jsonify({
+            'detected_ips': ['127.0.0.1'],
+            'default_port': '8088',
+            'error': str(e)
+        }), 500
+
+# ========== Validate Volume Mount ==========
+@app.route('/api/config/check-volume', methods=['GET'])
+def check_volume():
+    """Verify /volumes/supos/data mounted and writable"""
+    try:
+        volumes_path = '/volumes/supos/data'
+
+        exists = os.path.exists(volumes_path)
+
+        if exists:
+            writable = os.access(volumes_path, os.W_OK)
+            stat = os.statvfs(volumes_path)
+            free_gb = (stat.f_bavail * stat.f_frsize) / (1024**3)
+            total_gb = (stat.f_blocks * stat.f_frsize) / (1024**3)
+            sufficient = free_gb >= 20
+        else:
+            writable = False
+            free_gb = total_gb = 0
+            sufficient = False
+
+        return jsonify({
+            'path': volumes_path,
+            'mounted': exists,
+            'writable': writable,
+            'free_gb': round(free_gb, 2),
+            'total_gb': round(total_gb, 2),
+            'sufficient': sufficient
+        })
+
+    except Exception as e:
+        return jsonify({'mounted': False, 'error': str(e)}), 500
+
 # ==================== KEYCLOAK API ====================
 
 def create_keycloak_user(username, password, email, domain, port):
     """Create user in supos realm with super-admin CLIENT role and delete default user."""
     keycloak_url = f"http://{domain}:{port}/keycloak/home"
-    
+
     try:
         # Step 1: Get master admin token
         token_response = requests.post(
@@ -44,12 +110,12 @@ def create_keycloak_user(username, password, email, domain, port):
         )
         token_response.raise_for_status()
         token = token_response.json()["access_token"]
-        
+
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
         }
-        
+
         # Step 2: Create user in supos realm
         user_response = requests.post(
             f"{keycloak_url}/admin/realms/supos/users",
@@ -66,13 +132,13 @@ def create_keycloak_user(username, password, email, domain, port):
             },
             timeout=10
         )
-        
+
         if user_response.status_code == 409:
             return {"success": True, "message": f"User {username} already exists"}
-        
+
         if user_response.status_code != 201:
             return {"success": False, "message": f"User creation failed: HTTP {user_response.status_code}"}
-        
+
         # Step 3: Get created user's ID
         user_id = user_response.headers.get('Location', '').split('/')[-1]
         if not user_id:
@@ -85,7 +151,7 @@ def create_keycloak_user(username, password, email, domain, port):
             users = query_response.json()
             if users:
                 user_id = users[0]['id']
-        
+
         # Step 4: Get supos client UUID (not clientId)
         client_response = requests.get(
             f"{keycloak_url}/admin/realms/supos/clients?clientId=supos",
@@ -94,12 +160,12 @@ def create_keycloak_user(username, password, email, domain, port):
         )
         client_response.raise_for_status()
         clients = client_response.json()
-        
+
         if not clients:
             return {"success": False, "message": "supos client not found"}
-        
+
         supos_client_uuid = clients[0]['id']
-        
+
         # Step 5: Get super-admin role from supos CLIENT
         client_roles_response = requests.get(
             f"{keycloak_url}/admin/realms/supos/clients/{supos_client_uuid}/roles",
@@ -108,11 +174,11 @@ def create_keycloak_user(username, password, email, domain, port):
         )
         client_roles_response.raise_for_status()
         client_roles = client_roles_response.json()
-        
+
         super_admin_role = next((r for r in client_roles if r['name'] == 'super-admin'), None)
         if not super_admin_role:
             return {"success": False, "message": f"super-admin role not found in supos client. Available: {[r['name'] for r in client_roles]}"}
-        
+
         # Step 6: Assign CLIENT role to user
         role_assign_response = requests.post(
             f"{keycloak_url}/admin/realms/supos/users/{user_id}/role-mappings/clients/{supos_client_uuid}",
@@ -123,17 +189,17 @@ def create_keycloak_user(username, password, email, domain, port):
             }],
             timeout=10
         )
-        
+
         if role_assign_response.status_code not in [204, 200]:
             return {"success": False, "message": f"Role assignment failed: HTTP {role_assign_response.status_code}"}
-        
+
         # Step 7: Delete default 'supos' user
         default_user_response = requests.get(
             f"{keycloak_url}/admin/realms/supos/users?username=supos&exact=true",
             headers=headers,
             timeout=10
         )
-        
+
         if default_user_response.status_code == 200:
             default_users = default_user_response.json()
             for default_user in default_users:
@@ -145,12 +211,12 @@ def create_keycloak_user(username, password, email, domain, port):
                     )
                     if delete_response.status_code in [204, 200]:
                         break
-        
+
         return {
-            "success": True, 
+            "success": True,
             "message": f"User {username} created with super-admin role. Default user removed."
         }
-            
+
     except requests.exceptions.RequestException as e:
         return {"success": False, "message": f"Keycloak API error: {str(e)}"}
     except Exception as e:
@@ -219,16 +285,16 @@ def validate_setup():
     try:
         issues = []
         warnings = []
-        
+
         try:
             client.ping()
         except:
             issues.append("Docker socket unavailable")
-        
+
         volumes_path = os.getenv("VOLUMES_PATH", "/volumes/supos/data")
         if not os.path.exists(volumes_path):
             issues.append(f"Volumes path missing: {volumes_path}")
-        
+
         return jsonify({"valid": len(issues) == 0, "issues": issues, "warnings": warnings})
     except Exception as e:
         return jsonify({"valid": False, "issues": [str(e)], "warnings": []}), 500
@@ -241,27 +307,47 @@ def get_volumes_path():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ========== Update Config ==========
 @app.route('/api/config/update', methods=['POST'])
 def update_config():
+    """
+    Writes .env file for FIRST TIME.
+    Called by setup wizard after user confirms settings.
+    """
     try:
         data = request.get_json()
         env_file = os.path.join(WORKSPACE, '.env')
-        
+
+        # Extract inputs
+        ip_address = data.get('ip_address', '').strip()
+        port = data.get('entrance_port', '8088').strip()
+        resource_spec = data.get('resource_spec', '1')
+
+        if not ip_address:
+            return jsonify({'success': False, 'error': 'IP address required'}), 400
+
+        # Loopback check
+        is_loopback = ip_address in ['127.0.0.1', 'localhost']
+
+        # Read template .env or create from scratch
         if os.path.exists(env_file):
             with open(env_file, 'r') as f:
                 lines = f.readlines()
         else:
+            # No template, create basic structure
             lines = []
-        
+
+        # Update/add required fields
         updates = {
-            'ENTRANCE_DOMAIN': data.get('ip_address'),
-            'VOLUMES_PATH': data.get('volumes_path'),
-            'OS_RESOURCE_SPEC': data.get('resource_spec', '1')
+            'ENTRANCE_DOMAIN': ip_address,
+            'ENTRANCE_PORT': port,
+            'OS_RESOURCE_SPEC': resource_spec,
+            'OS_AUTH_ENABLE': 'false' if is_loopback else 'true',
+            'VOLUMES_PATH': '/volumes/supos/data'
         }
-        
+
+        # Update existing or append new
         for key, value in updates.items():
-            if value is None:
-                continue
             found = False
             for i, line in enumerate(lines):
                 if line.startswith(f'{key}='):
@@ -270,13 +356,18 @@ def update_config():
                     break
             if not found:
                 lines.append(f'{key}={value}\n')
-        
+
+        # Write .env
         with open(env_file, 'w') as f:
             f.writelines(lines)
-        
-        return jsonify({"success": True})
+
+        return jsonify({
+            'success': True,
+            'loopback_warning': is_loopback
+        })
+
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 # Get host IP that spawned containers can reach
 def get_host_ip():
@@ -301,14 +392,14 @@ def start_install():
         admin_data = data.get('admin', {})
         network_data = data.get('network', {})
         selected_apps = data.get('selected_apps', [])
-        
+
         logs = ["Starting installation..."]
-        
+
         # Update .env file
         env_file = os.path.join(WORKSPACE, '.env')
         with open(env_file, 'r') as f:
             env_vars = dict(line.strip().split('=', 1) for line in f if '=' in line and not line.startswith('#'))
-        
+
         updates = {
             'KEYCLOAK_ADMIN_USERNAME': admin_data.get('username', 'admin'),
             'KEYCLOAK_ADMIN_PASSWORD': admin_data.get('password', 'admin'),
@@ -317,18 +408,18 @@ def start_install():
             'SELECTED_PROFILES': ','.join(selected_apps),
             'ORCHESTRATOR_HOST': get_host_ip()
         }
-        
+
         env_vars.update(updates)
-        
+
         with open(env_file, 'w') as f:
             for key, value in env_vars.items():
                 f.write(f'{key}={value}\n')
         with open(INSTALL_LOG, 'w') as log_file:
             log_file.write(f"✓ Configuration saved to .env \n")
-        
+
         # Run installation with log streaming
         install_script = os.path.join(WORKSPACE, 'bin/install.sh')
-        
+
         with open(INSTALL_LOG, 'a') as log_file:
             log_file.write(f"Running: {install_script} --non-interactive")
 
@@ -338,7 +429,7 @@ def start_install():
             log_file.write(f"Apps: {', '.join(selected_apps) if selected_apps else 'none'}\n")
             log_file.write("="*60 + "\n\n")
             log_file.flush()
-            
+
             process = subprocess.Popen(
                 ['/bin/bash', install_script, '--non-interactive'],
                 cwd=WORKSPACE,
@@ -348,10 +439,10 @@ def start_install():
                 bufsize=1,
                 env=os.environ.copy()
             )
-            
+
             # Wait for completion
             return_code = process.wait()
-            
+
             if return_code != 0:
                 with open(INSTALL_LOG, 'a') as f:
                     f.write(f"\n\n[ERROR] Installation failed with exit code {return_code}\n")
@@ -362,9 +453,9 @@ def start_install():
                     "log_file": "/api/install/logs"
                 }), 500
 
-        with open(INSTALL_LOG, 'a') as log_file:        
+        with open(INSTALL_LOG, 'a') as log_file:
             log_file.write("✓ Installation script completed")
-            
+
             # Wait for Keycloak and create admin user
 
             log_file.write("\nCreating admin user in Keycloak supos realm...")
@@ -376,11 +467,11 @@ def start_install():
                 port=network_data.get('port', 8088)
             )
             log_file.write(keycloak_result['message'])
-            
+
             if not keycloak_result['success']:
                 log_file.write("\n⚠ Keycloak user creation failed, but installation complete")
                 log_file.write("\nYou can still login with default: supos/supos")
-            
+
             # Save configuration
             config = load_config()
             config['installed_apps'] = selected_apps
@@ -388,9 +479,9 @@ def start_install():
             config['network'] = network_data
             save_config(config)
             write_setup_flag(config)
-            
+
             log_file.write("\n✓ Installation complete!")
-            
+
             return jsonify({
                 "success": True,
                 "message": "Installation complete",
@@ -398,7 +489,7 @@ def start_install():
                 "log_file": "/api/install/logs",
                 "access_url": f"http://{network_data.get('domain')}:{network_data.get('port', 8088)}/home"
             })
-        
+
     except subprocess.TimeoutExpired:
         return jsonify({
             "success": False,
@@ -433,7 +524,7 @@ def view_full_logs():
     """Stream complete installation log as plain text."""
     if not os.path.exists(INSTALL_LOG):
         return "No installation log found.\nStart installation from the wizard.", 404
-    
+
     with open(INSTALL_LOG, 'r') as f:
         return Response(f.read(), mimetype='text/plain')
 
@@ -442,7 +533,7 @@ def tail_logs():
     """Get last 100 lines for polling during installation."""
     if not os.path.exists(INSTALL_LOG):
         return jsonify({"logs": "", "exists": False}), 200
-    
+
     try:
         with open(INSTALL_LOG, 'r') as f:
             lines = f.readlines()
@@ -457,14 +548,14 @@ def supos_status():
     try:
         containers = client.containers.list(all=True, filters={"name": "supos"})
         status_list = []
-        
+
         for container in containers:
             status_list.append({
                 "name": container.name,
                 "status": container.status,
                 "id": container.short_id
             })
-        
+
         return jsonify({
             "containers": status_list,
             "count": len(status_list)
