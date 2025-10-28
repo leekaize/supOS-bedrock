@@ -15,6 +15,7 @@ function App() {
   const [adminData, setAdminData] = useState(null);
   const [selectedApps, setSelectedApps] = useState([]);
   const [setupComplete, setSetupComplete] = useState(false);
+  const [dashboardUrl, setDashboardUrl] = useState('http://localhost:8088/home');
 
   const steps = [
     {
@@ -57,7 +58,10 @@ function App() {
     next();
   };
 
-  const handleInstallComplete = () => {
+  const handleInstallComplete = (accessUrl) => {
+    if (accessUrl) {
+      setDashboardUrl(accessUrl);
+    }
     setSetupComplete(true);
   };
 
@@ -69,7 +73,7 @@ function App() {
           title="supOS Platform Ready"
           subTitle="Setup complete. Redirecting to dashboard..."
           extra={[
-            <Button type="primary" key="dashboard" href="http://localhost:8088/home">
+            <Button type="primary" key="dashboard" href={dashboardUrl}>
               Go to Dashboard
             </Button>,
           ]}
@@ -96,7 +100,7 @@ function App() {
             <AdminForm onComplete={handleAdminComplete} onBack={prev} />
           )}
           {current === 2 && (
-            <AppSelection 
+            <AppSelection
               selectedApps={selectedApps}
               onComplete={handleAppSelection}
               onBack={prev}

@@ -7,6 +7,8 @@ import time
 import subprocess
 import requests
 import docker
+import threading
+import re
 from datetime import datetime
 from flask import Flask, jsonify, request, send_from_directory, Response, redirect, session
 from flask_cors import CORS
@@ -25,6 +27,9 @@ os.makedirs(LOG_DIR, exist_ok=True)
 INSTALL_LOG = os.path.join(LOG_DIR, 'install.log')
 
 client = docker.from_env()
+
+installation_process = None
+installation_data = {}
 
 # ==================== AUTHENTICATION ====================
 
@@ -410,6 +415,111 @@ def create_keycloak_user(username, password, email, domain, port):
     except Exception as e:
         return {"success": False, "message": f"Error: {str(e)}"}
 
+def configure_keycloak_orchestrator_client(domain, port=8088):
+    """
+    Register orchestrator's callback URL in Keycloak admin-cli client.
+    Called after installation completes.
+    """
+    keycloak_url = "http://172.17.0.1:8081"
+    orchestrator_callback = f"http://{domain}:8080/auth/callback"
+
+    def check_keycloak_health(host, port):
+        import socket
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                return True
+        except OSError:
+            return False
+
+    try:
+        # Wait for Keycloak
+        for i in range(30):
+            if check_keycloak_health("172.17.0.1", 8081):
+                break
+            time.sleep(2)
+        else:
+            return {"success": False, "message": "Keycloak not ready"}
+
+        # Get admin token
+        token_resp = requests.post(
+            f"{keycloak_url}/realms/master/protocol/openid-connect/token",
+            data={
+                "client_id": "admin-cli",
+                "username": "admin",
+                "password": "supos",
+                "grant_type": "password"
+            },
+            timeout=10
+        )
+        token_resp.raise_for_status()
+        token = token_resp.json()["access_token"]
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+
+        # Get admin-cli client ID
+        clients_resp = requests.get(
+            f"{keycloak_url}/admin/realms/master/clients?clientId=admin-cli",
+            headers=headers,
+            timeout=10
+        )
+        clients_resp.raise_for_status()
+        clients = clients_resp.json()
+
+        if not clients:
+            return {"success": False, "message": "admin-cli client not found"}
+
+        client_uuid = clients[0]["id"]
+
+        # Get current client config
+        client_resp = requests.get(
+            f"{keycloak_url}/admin/realms/master/clients/{client_uuid}",
+            headers=headers,
+            timeout=10
+        )
+        client_resp.raise_for_status()
+        client_config = client_resp.json()
+
+        # Update redirect URIs
+        redirect_uris = client_config.get("redirectUris", [])
+        if orchestrator_callback not in redirect_uris:
+            redirect_uris.append(orchestrator_callback)
+            redirect_uris.append(f"http://{domain}:8080/*")  # Wildcard for flexibility
+
+        # Update web origins for CORS
+        web_origins = client_config.get("webOrigins", [])
+        orchestrator_origin = f"http://{domain}:8080"
+        if orchestrator_origin not in web_origins:
+            web_origins.append(orchestrator_origin)
+
+        # Update client
+        client_config["redirectUris"] = redirect_uris
+        client_config["webOrigins"] = web_origins
+        client_config["publicClient"] = True  # No client secret needed
+
+        update_resp = requests.put(
+            f"{keycloak_url}/admin/realms/master/clients/{client_uuid}",
+            headers=headers,
+            json=client_config,
+            timeout=10
+        )
+
+        if update_resp.status_code in [200, 204]:
+            return {
+                "success": True,
+                "message": f"✓ Orchestrator callback registered: {orchestrator_callback}"
+            }
+        else:
+            return {
+                "success": False,
+                "message": f"Failed to update client: {update_resp.text}"
+            }
+
+    except Exception as e:
+        return {"success": False, "message": f"Keycloak client config error: {str(e)}"}
+
 # ==================== CONFIG MANAGEMENT ====================
 
 def load_config():
@@ -602,16 +712,35 @@ def get_host_ip():
     except:
         return "172.17.0.1"
 
-@app.route('/api/install/start', methods=['POST'])
-def start_install():
+
+# ===================== INSTALLATION =======================
+def sanitize_log_line(line):
+    """Remove sensitive data from log lines"""
+    # Remove passwords from environment variable assignments
+    line = re.sub(r'(PASSWORD|TOKEN|SECRET|KEY)=\S+', r'\1=***REDACTED***', line, flags=re.IGNORECASE)
+    # Remove passwords from command-line arguments
+    line = re.sub(r'--password[\s=]\S+', r'--password=***REDACTED***', line, flags=re.IGNORECASE)
+    line = re.sub(r'-p[\s=]\S+', r'-p=***REDACTED***', line)
+    # Remove admin credentials from log headers
+    line = re.sub(r'(Admin|Username|User):\s*\S+', r'\1: ***REDACTED***', line, flags=re.IGNORECASE)
+
+    # Remove default credential display blocks
+    if 'Default user name:' in line:
+        return ''  # Skip this line entirely
+    if line.strip().startswith('password:') and line.strip() != 'password: ***REDACTED***':
+        return ''  # Skip standalone password display
+
+    # Simplify keycloak user creation message
+    if 'User' in line and 'created in both realms' in line:
+        return '✓ Custom admin user created successfully\n'
+
+    return line
+
+def run_installation_async(admin_data, network_data, selected_apps):
+    """Run installation in background thread"""
+    global installation_data
+
     try:
-        data = request.json
-        admin_data = data.get('admin', {})
-        network_data = data.get('network', {})
-        selected_apps = data.get('selected_apps', [])
-
-        logs = ["Starting installation..."]
-
         env_file = os.path.join(WORKSPACE, '.env')
         with open(env_file, 'r') as f:
             env_vars = dict(line.strip().split('=', 1) for line in f if '=' in line and not line.startswith('#'))
@@ -639,7 +768,7 @@ def start_install():
         with open(INSTALL_LOG, 'a') as log_file:
             log_file.write(f"Running: {install_script} --non-interactive\n")
             log_file.write(f"\n=== Installation started at {datetime.now()} ===\n")
-            log_file.write(f"Admin: {admin_data.get('username')}\n")
+            log_file.write(f"Admin: ***REDACTED***\n")
             log_file.write(f"Domain: {network_data.get('domain')}\n")
             log_file.write(f"Apps: {', '.join(selected_apps) if selected_apps else 'none'}\n")
             log_file.write("="*60 + "\n\n")
@@ -655,16 +784,16 @@ def start_install():
                 env=os.environ.copy()
             )
 
+            installation_data['process'] = process
+            installation_data['status'] = 'running'
+
             return_code = process.wait()
 
             if return_code != 0:
                 log_file.write(f"\n\n[ERROR] Installation failed with exit code {return_code}\n")
-                return jsonify({
-                    "success": False,
-                    "error": f"Installation script failed (exit {return_code})",
-                    "logs": logs,
-                    "log_file": "/api/install/logs"
-                }), 500
+                installation_data['status'] = 'failed'
+                installation_data['error'] = f"Installation script failed (exit {return_code})"
+                return
 
         with open(INSTALL_LOG, 'a') as log_file:
             log_file.write("✓ Installation script completed\n")
@@ -679,37 +808,120 @@ def start_install():
             )
             log_file.write(keycloak_result['message'] + "\n")
 
+            log_file.write("\nConfiguring orchestrator OAuth callback...\n")
+            oauth_result = configure_keycloak_orchestrator_client(
+                domain=network_data.get('domain'),
+                port=network_data.get('port', 8088)
+            )
+            log_file.write(oauth_result['message'] + "\n")
+
             if not keycloak_result['success']:
                 log_file.write("\n⚠ Keycloak user creation failed\n")
-                log_file.write("\nYou can still login with default: admin/supos\n")
 
             config = load_config()
             config['installed_apps'] = selected_apps
-            config['admin'] = admin_data
+            config['admin'] = {'username': admin_data.get('username'), 'email': admin_data.get('email')}
             config['network'] = network_data
             save_config(config)
             write_setup_flag(config)
 
             log_file.write("\n✓ Installation complete!\n")
 
-        return jsonify({
-            "success": True,
-            "message": "Installation complete",
-            "logs": logs,
-            "log_file": "/api/install/logs",
-            "access_url": f"http://{network_data.get('domain')}:{network_data.get('port', 8088)}/home"
-        })
+        installation_data['status'] = 'completed'
+        installation_data['access_url'] = f"http://{network_data.get('domain')}:{network_data.get('port', 8088)}/home"
 
     except Exception as e:
         import traceback
         with open(INSTALL_LOG, 'a') as f:
             f.write(f"\n\n[EXCEPTION]\n{traceback.format_exc()}\n")
+        installation_data['status'] = 'failed'
+        installation_data['error'] = str(e)
+
+@app.route('/api/install/start', methods=['POST'])
+def start_install():
+    """Start installation in background and return immediately"""
+    global installation_process, installation_data
+
+    try:
+        data = request.json
+        admin_data = data.get('admin', {})
+        network_data = data.get('network', {})
+        selected_apps = data.get('selected_apps', [])
+
+        # Reset installation state
+        installation_data = {
+            'status': 'starting',
+            'started_at': datetime.now().isoformat()
+        }
+
+        # Start installation in background thread
+        thread = threading.Thread(
+            target=run_installation_async,
+            args=(admin_data, network_data, selected_apps),
+            daemon=True
+        )
+        thread.start()
+        installation_process = thread
+
+        return jsonify({
+            "success": True,
+            "message": "Installation started in background",
+            "log_endpoint": "/api/install/logs/stream"
+        })
+
+    except Exception as e:
+        import traceback
         return jsonify({
             "success": False,
             "error": str(e),
-            "trace": traceback.format_exc(),
-            "logs": logs,
-            "log_file": "/api/install/logs"
+            "trace": traceback.format_exc()
+        }), 500
+
+@app.route('/api/install/logs/stream')
+def stream_logs():
+    """Stream logs incrementally with sanitization"""
+    global installation_data
+
+    from_line = request.args.get('from', 0, type=int)
+
+    if not os.path.exists(INSTALL_LOG):
+        return jsonify({
+            "lines": [],
+            "current_line": 0,
+            "completed": False,
+            "failed": False
+        })
+
+    try:
+        with open(INSTALL_LOG, 'r') as f:
+            all_lines = f.readlines()
+
+        # Get new lines since last poll
+        new_lines = all_lines[from_line:]
+
+        # Sanitize each line
+        sanitized = [sanitize_log_line(line.rstrip()) for line in new_lines]
+
+        # Determine status
+        status = installation_data.get('status', 'unknown')
+        completed = status == 'completed'
+        failed = status == 'failed'
+
+        return jsonify({
+            "lines": sanitized,
+            "current_line": len(all_lines),
+            "completed": completed,
+            "failed": failed,
+            "status": status
+        })
+
+    except Exception as e:
+        return jsonify({
+            "lines": [],
+            "current_line": from_line,
+            "error": str(e),
+            "completed": False,
+            "failed": False
         }), 500
 
 @app.route('/api/install/status')
@@ -727,7 +939,9 @@ def view_full_logs():
         return "No installation log found.\nStart installation from the wizard.", 404
 
     with open(INSTALL_LOG, 'r') as f:
-        return Response(f.read(), mimetype='text/plain')
+        lines = f.readlines()
+        sanitized = [sanitize_log_line(line) for line in lines]
+        return Response(''.join(sanitized), mimetype='text/plain')
 
 @app.route('/api/install/logs/tail')
 def tail_logs():
