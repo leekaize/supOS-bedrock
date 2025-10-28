@@ -305,14 +305,14 @@ services:
       service_logo: keycloak-original.svg
       service_description: aboutus.keycloakDescription
       service_redirect_url: /keycloak/home/
-      service_account: admin
-      service_password: supos
+      service_account: ${KEYCLOAK_ADMIN_USERNAME:-admin}
+      service_password: ${KEYCLOAK_ADMIN_PASSWORD:-supos}
       KC_SSL_REQUIRED: none  # 不要求 SSL
       KC_PROXY: passthrough                       # 设置代理模式
       KC_HOSTNAME: "${ENTRANCE_DOMAIN}"              # 指定主机名
       KC_FRONTEND_URL: "https://${ENTRANCE_DOMAIN}:${ENTRANCE_PORT}"  # 设置前端 URL
-      KC_BOOTSTRAP_ADMIN_USERNAME: admin
-      KC_BOOTSTRAP_ADMIN_PASSWORD: supos
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USERNAME:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-supos}
       KC_COOKIE_SECURE: false                          # 禁用安全 cookie
       KC_DB: postgres
       KC_DB_URL: "jdbc:postgresql://postgresql:5432/keycloak"

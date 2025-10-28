@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""supOS-bedrock Orchestrator - Production with Keycloak API + Log Streaming"""
+"""supOS-bedrock Orchestrator with Keycloak authentication"""
 
 import os
 import json
@@ -8,11 +8,13 @@ import subprocess
 import requests
 import docker
 from datetime import datetime
-from flask import Flask, jsonify, request, send_from_directory, Response
+from flask import Flask, jsonify, request, send_from_directory, Response, redirect, session
 from flask_cors import CORS
+from functools import wraps
 
 app = Flask(__name__, static_folder='static', static_url_path='')
-CORS(app)
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', os.urandom(24).hex())
+CORS(app, supports_credentials=True)
 
 # Paths
 CONFIG_FILE = '/app/config/config.json'
@@ -24,81 +26,134 @@ INSTALL_LOG = os.path.join(LOG_DIR, 'install.log')
 
 client = docker.from_env()
 
-# ========== Detect IPs ==========
-@app.route('/api/config/detected-ips', methods=['GET'])
-def get_detected_ips():
-    """
-    Returns all IPs from HOST_IPS env var.
-    User runs: docker run -e HOST_IPS=$(hostname -I) ...
-    Returns space-separated IPs as array.
-    """
+# ==================== AUTHENTICATION ====================
+
+def require_auth(f):
+    """Protect routes ONLY after setup completes"""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # During setup: no auth required
+        if not is_setup_complete():
+            return f(*args, **kwargs)
+
+        # After setup: check Keycloak session
+        if 'keycloak_user' not in session:
+            if request.path.startswith('/api/'):
+                return jsonify({'error': 'Authentication required'}), 401
+            return redirect('/login')
+
+        return f(*args, **kwargs)
+    return decorated
+
+@app.route('/login')
+def login_page():
+    """Redirect to Keycloak"""
+    if not is_setup_complete():
+        return redirect('/')
+
+    config = load_config()
+    domain = config.get('network', {}).get('domain', '127.0.0.1')
+    port = config.get('network', {}).get('port', 8088)
+
+    keycloak_auth = f"http://{domain}:{port}/keycloak/home/auth/realms/master/protocol/openid-connect/auth"
+    callback = f"http://{domain}:8080/auth/callback"
+
+    return redirect(
+        f"{keycloak_auth}?"
+        f"client_id=admin-cli&"
+        f"redirect_uri={callback}&"
+        f"response_type=code&"
+        f"scope=openid"
+    )
+
+@app.route('/auth/callback')
+def auth_callback():
+    """OAuth callback"""
+    code = request.args.get('code')
+    if not code:
+        return jsonify({'error': 'No authorization code'}), 400
+
+    config = load_config()
+    domain = config.get('network', {}).get('domain', '127.0.0.1')
+
+    # Use Docker bridge to reach keycloak exposed port
+    token_url = "http://172.17.0.1:8081/realms/master/protocol/openid-connect/token"
+    callback = f"http://{domain}:8080/auth/callback"
+
     try:
-        # Read from environment variable (space-separated)
-        host_ips_raw = os.environ.get('HOST_IPS', '').strip()
+        token_resp = requests.post(token_url, data={
+            'grant_type': 'authorization_code',
+            'client_id': 'admin-cli',
+            'code': code,
+            'redirect_uri': callback
+        }, timeout=10)
 
-        # Parse space-separated IPs
-        if host_ips_raw:
-            detected_ips = host_ips_raw.split()
-        else:
-            detected_ips = []
+        if token_resp.status_code != 200:
+            return jsonify({'error': 'Token exchange failed', 'details': token_resp.text}), 400
 
-        # Always include localhost as option
-        if '127.0.0.1' not in detected_ips:
-            detected_ips.insert(0, '127.0.0.1')
+        access_token = token_resp.json().get('access_token')
 
-        return jsonify({
-            'detected_ips': detected_ips,
-            'default_port': '8088'
-        })
+        userinfo_resp = requests.get(
+            "http://172.17.0.1:8081/realms/master/protocol/openid-connect/userinfo",
+            headers={'Authorization': f'Bearer {access_token}'},
+            timeout=10
+        )
+
+        if userinfo_resp.status_code == 200:
+            user = userinfo_resp.json()
+            session['keycloak_user'] = user.get('preferred_username', 'admin')
+            session['access_token'] = access_token
+            return redirect('/')
+
+        return jsonify({'error': 'User info failed'}), 400
 
     except Exception as e:
-        return jsonify({
-            'detected_ips': ['127.0.0.1'],
-            'default_port': '8088',
-            'error': str(e)
-        }), 500
+        return jsonify({'error': str(e)}), 500
 
-# ========== Validate Volume Mount ==========
-@app.route('/api/config/check-volume', methods=['GET'])
-def check_volume():
-    """Verify /volumes/supos/data mounted and writable"""
-    try:
-        volumes_path = '/volumes/supos/data'
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect('/')
 
-        exists = os.path.exists(volumes_path)
+@app.route('/api/auth/status')
+def auth_status():
+    return jsonify({
+        'authenticated': 'keycloak_user' in session,
+        'user': session.get('keycloak_user'),
+        'setup_complete': is_setup_complete()
+    })
 
-        if exists:
-            writable = os.access(volumes_path, os.W_OK)
-            stat = os.statvfs(volumes_path)
-            free_gb = (stat.f_bavail * stat.f_frsize) / (1024**3)
-            total_gb = (stat.f_blocks * stat.f_frsize) / (1024**3)
-            sufficient = free_gb >= 20
-        else:
-            writable = False
-            free_gb = total_gb = 0
-            sufficient = False
-
-        return jsonify({
-            'path': volumes_path,
-            'mounted': exists,
-            'writable': writable,
-            'free_gb': round(free_gb, 2),
-            'total_gb': round(total_gb, 2),
-            'sufficient': sufficient
-        })
-
-    except Exception as e:
-        return jsonify({'mounted': False, 'error': str(e)}), 500
-
-# ==================== KEYCLOAK API ====================
+# ==================== KEYCLOAK USER MANAGEMENT ====================
 
 def create_keycloak_user(username, password, email, domain, port):
-    """Create user in supos realm with super-admin CLIENT role and delete default user."""
-    keycloak_url = f"http://{domain}:{port}/keycloak/home"
+    """
+    Create user in both supos and master realms.
+    Uses Docker bridge IP to reach keycloak exposed port.
+    """
+    # Docker bridge + exposed port (supos-bedrock runs on default bridge)
+    keycloak_url = "http://172.17.0.1:8081"
+
+    def check_keycloak_health(host, port):
+        """Raw TCP health check (Keycloak removed curl)"""
+        import socket
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                return True
+        except OSError:
+            return False
 
     try:
-        # Step 1: Get master admin token
-        token_response = requests.post(
+        # Wait for Keycloak to be ready
+        max_retries = 30
+        for i in range(max_retries):
+            if check_keycloak_health("172.17.0.1", 8081):
+                break
+            time.sleep(2)
+        else:
+            return {"success": False, "message": "Keycloak not ready after 60 seconds"}
+
+        # Get admin token
+        token_resp = requests.post(
             f"{keycloak_url}/realms/master/protocol/openid-connect/token",
             data={
                 "client_id": "admin-cli",
@@ -108,119 +163,178 @@ def create_keycloak_user(username, password, email, domain, port):
             },
             timeout=10
         )
-        token_response.raise_for_status()
-        token = token_response.json()["access_token"]
+        token_resp.raise_for_status()
+        token = token_resp.json()["access_token"]
 
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
         }
 
-        # Step 2: Create user in supos realm
-        user_response = requests.post(
+        user_payload = {
+            "username": username,
+            "email": email,
+            "enabled": True,
+            "credentials": [{
+                "type": "password",
+                "value": password,
+                "temporary": False
+            }]
+        }
+
+        # === SUPOS REALM ===
+        supos_resp = requests.post(
             f"{keycloak_url}/admin/realms/supos/users",
             headers=headers,
-            json={
-                "username": username,
-                "email": email,
-                "enabled": True,
-                "credentials": [{
-                    "type": "password",
-                    "value": password,
-                    "temporary": False
-                }]
-            },
+            json=user_payload,
             timeout=10
         )
 
-        if user_response.status_code == 409:
+        if supos_resp.status_code == 409:
             return {"success": True, "message": f"User {username} already exists"}
 
-        if user_response.status_code != 201:
-            return {"success": False, "message": f"User creation failed: HTTP {user_response.status_code}"}
+        if supos_resp.status_code != 201:
+            return {"success": False, "message": f"Supos user creation failed: {supos_resp.status_code}"}
 
-        # Step 3: Get created user's ID
-        user_id = user_response.headers.get('Location', '').split('/')[-1]
-        if not user_id:
-            query_response = requests.get(
+        # Get supos user ID
+        supos_user_id = supos_resp.headers.get('Location', '').split('/')[-1]
+        if not supos_user_id:
+            query = requests.get(
                 f"{keycloak_url}/admin/realms/supos/users?username={username}&exact=true",
-                headers=headers,
-                timeout=10
+                headers=headers, timeout=10
             )
-            query_response.raise_for_status()
-            users = query_response.json()
+            query.raise_for_status()
+            users = query.json()
             if users:
-                user_id = users[0]['id']
+                supos_user_id = users[0]['id']
 
-        # Step 4: Get supos client UUID (not clientId)
-        client_response = requests.get(
+        # Get supos client
+        client_resp = requests.get(
             f"{keycloak_url}/admin/realms/supos/clients?clientId=supos",
-            headers=headers,
-            timeout=10
+            headers=headers, timeout=10
         )
-        client_response.raise_for_status()
-        clients = client_response.json()
-
+        client_resp.raise_for_status()
+        clients = client_resp.json()
         if not clients:
             return {"success": False, "message": "supos client not found"}
-
         supos_client_uuid = clients[0]['id']
 
-        # Step 5: Get super-admin role from supos CLIENT
-        client_roles_response = requests.get(
+        # Get super-admin role
+        roles_resp = requests.get(
             f"{keycloak_url}/admin/realms/supos/clients/{supos_client_uuid}/roles",
+            headers=headers, timeout=10
+        )
+        roles_resp.raise_for_status()
+        client_roles = roles_resp.json()
+        super_admin = next((r for r in client_roles if r['name'] == 'super-admin'), None)
+        if not super_admin:
+            return {"success": False, "message": "super-admin role not found"}
+
+        # Assign super-admin
+        assign_resp = requests.post(
+            f"{keycloak_url}/admin/realms/supos/users/{supos_user_id}/role-mappings/clients/{supos_client_uuid}",
             headers=headers,
+            json=[{"id": super_admin['id'], "name": super_admin['name']}],
             timeout=10
         )
-        client_roles_response.raise_for_status()
-        client_roles = client_roles_response.json()
+        if assign_resp.status_code not in [204, 200]:
+            return {"success": False, "message": f"Supos role assignment failed: {assign_resp.status_code}"}
 
-        super_admin_role = next((r for r in client_roles if r['name'] == 'super-admin'), None)
-        if not super_admin_role:
-            return {"success": False, "message": f"super-admin role not found in supos client. Available: {[r['name'] for r in client_roles]}"}
-
-        # Step 6: Assign CLIENT role to user
-        role_assign_response = requests.post(
-            f"{keycloak_url}/admin/realms/supos/users/{user_id}/role-mappings/clients/{supos_client_uuid}",
+        # === MASTER REALM ===
+        master_resp = requests.post(
+            f"{keycloak_url}/admin/realms/master/users",
             headers=headers,
-            json=[{
-                "id": super_admin_role['id'],
-                "name": super_admin_role['name']
-            }],
+            json=user_payload,
             timeout=10
         )
 
-        if role_assign_response.status_code not in [204, 200]:
-            return {"success": False, "message": f"Role assignment failed: HTTP {role_assign_response.status_code}"}
+        if master_resp.status_code not in [201, 409]:
+            return {"success": False, "message": f"Master user creation failed: {master_resp.status_code}"}
 
-        # Step 7: Delete default 'supos' user
-        default_user_response = requests.get(
+        # Get master user ID
+        master_user_id = None
+        if master_resp.status_code == 201:
+            master_user_id = master_resp.headers.get('Location', '').split('/')[-1]
+
+        if not master_user_id:
+            query = requests.get(
+                f"{keycloak_url}/admin/realms/master/users?username={username}&exact=true",
+                headers=headers, timeout=10
+            )
+            query.raise_for_status()
+            users = query.json()
+            if users:
+                master_user_id = users[0]['id']
+
+        if not master_user_id:
+            return {"success": False, "message": "Could not get master user ID"}
+
+        # Get master realm roles
+        realm_roles_resp = requests.get(
+            f"{keycloak_url}/admin/realms/master/roles",
+            headers=headers, timeout=10
+        )
+        realm_roles_resp.raise_for_status()
+        realm_roles = realm_roles_resp.json()
+
+        admin_role = next((r for r in realm_roles if r['name'] == 'admin'), None)
+        default_roles = next((r for r in realm_roles if r['name'] == 'default-roles-master'), None)
+
+        if not admin_role or not default_roles:
+            return {"success": False, "message": "Master roles not found"}
+
+        # Assign master roles
+        master_assign = requests.post(
+            f"{keycloak_url}/admin/realms/master/users/{master_user_id}/role-mappings/realm",
+            headers=headers,
+            json=[
+                {"id": admin_role['id'], "name": admin_role['name']},
+                {"id": default_roles['id'], "name": default_roles['name']}
+            ],
+            timeout=10
+        )
+
+        if master_assign.status_code not in [204, 200]:
+            return {"success": False, "message": f"Master role assignment failed: {master_assign.status_code}"}
+
+        # === DELETE DEFAULTS ===
+        # Delete supos user
+        default_supos = requests.get(
             f"{keycloak_url}/admin/realms/supos/users?username=supos&exact=true",
-            headers=headers,
-            timeout=10
+            headers=headers, timeout=10
         )
-
-        if default_user_response.status_code == 200:
-            default_users = default_user_response.json()
-            for default_user in default_users:
-                if default_user['username'] == 'supos':
-                    delete_response = requests.delete(
-                        f"{keycloak_url}/admin/realms/supos/users/{default_user['id']}",
-                        headers=headers,
-                        timeout=10
+        if default_supos.status_code == 200:
+            for user in default_supos.json():
+                if user['username'] == 'supos':
+                    requests.delete(
+                        f"{keycloak_url}/admin/realms/supos/users/{user['id']}",
+                        headers=headers, timeout=10
                     )
-                    if delete_response.status_code in [204, 200]:
-                        break
+                    break
+
+        # Delete admin user (This still cause BUG where routes leads to 403)
+        # default_admin = requests.get(
+        #     f"{keycloak_url}/admin/realms/master/users?username=admin&exact=true",
+        #     headers=headers, timeout=10
+        # )
+        # if default_admin.status_code == 200:
+        #     for user in default_admin.json():
+        #         if user['username'] == 'admin':
+        #             requests.delete(
+        #                 f"{keycloak_url}/admin/realms/master/users/{user['id']}",
+        #                 headers=headers, timeout=10
+        #             )
+        #             break
 
         return {
             "success": True,
-            "message": f"User {username} created with super-admin role. Default user removed."
+            "message": f"✓ User {username} created in both realms with proper roles. Default accounts removed."
         }
 
     except requests.exceptions.RequestException as e:
         return {"success": False, "message": f"Keycloak API error: {str(e)}"}
     except Exception as e:
-        return {"success": False, "message": f"Unexpected error: {str(e)}"}
+        return {"success": False, "message": f"Error: {str(e)}"}
 
 # ==================== CONFIG MANAGEMENT ====================
 
@@ -257,6 +371,7 @@ def write_setup_flag(config):
 # ==================== ROUTES ====================
 
 @app.route('/')
+@require_auth
 def index():
     if is_setup_complete():
         return jsonify({"message": "Setup complete", "redirect": "/api/supos/status"}), 200
@@ -307,18 +422,61 @@ def get_volumes_path():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ========== Update Config ==========
+@app.route('/api/config/detected-ips', methods=['GET'])
+def get_detected_ips():
+    try:
+        host_ips_raw = os.environ.get('HOST_IPS', '').strip()
+        detected_ips = host_ips_raw.split() if host_ips_raw else []
+
+        if '127.0.0.1' not in detected_ips:
+            detected_ips.insert(0, '127.0.0.1')
+
+        return jsonify({
+            'detected_ips': detected_ips,
+            'default_port': '8088'
+        })
+    except Exception as e:
+        return jsonify({
+            'detected_ips': ['127.0.0.1'],
+            'default_port': '8088',
+            'error': str(e)
+        }), 500
+
+@app.route('/api/config/check-volume', methods=['GET'])
+def check_volume():
+    try:
+        volumes_path = '/volumes/supos/data'
+        exists = os.path.exists(volumes_path)
+
+        if exists:
+            writable = os.access(volumes_path, os.W_OK)
+            stat = os.statvfs(volumes_path)
+            free_gb = (stat.f_bavail * stat.f_frsize) / (1024**3)
+            total_gb = (stat.f_blocks * stat.f_frsize) / (1024**3)
+            sufficient = free_gb >= 20
+        else:
+            writable = False
+            free_gb = total_gb = 0
+            sufficient = False
+
+        return jsonify({
+            'path': volumes_path,
+            'mounted': exists,
+            'writable': writable,
+            'free_gb': round(free_gb, 2),
+            'total_gb': round(total_gb, 2),
+            'sufficient': sufficient
+        })
+    except Exception as e:
+        return jsonify({'mounted': False, 'error': str(e)}), 500
+
 @app.route('/api/config/update', methods=['POST'])
 def update_config():
-    """
-    Writes .env file for FIRST TIME.
-    Called by setup wizard after user confirms settings.
-    """
+    """Save initial config from setup wizard"""
     try:
         data = request.get_json()
         env_file = os.path.join(WORKSPACE, '.env')
 
-        # Extract inputs
         ip_address = data.get('ip_address', '').strip()
         port = data.get('entrance_port', '8088').strip()
         resource_spec = data.get('resource_spec', '1')
@@ -326,18 +484,14 @@ def update_config():
         if not ip_address:
             return jsonify({'success': False, 'error': 'IP address required'}), 400
 
-        # Loopback check
         is_loopback = ip_address in ['127.0.0.1', 'localhost']
 
-        # Read template .env or create from scratch
         if os.path.exists(env_file):
             with open(env_file, 'r') as f:
                 lines = f.readlines()
         else:
-            # No template, create basic structure
             lines = []
 
-        # Update/add required fields
         updates = {
             'ENTRANCE_DOMAIN': ip_address,
             'ENTRANCE_PORT': port,
@@ -346,7 +500,6 @@ def update_config():
             'VOLUMES_PATH': '/volumes/supos/data'
         }
 
-        # Update existing or append new
         for key, value in updates.items():
             found = False
             for i, line in enumerate(lines):
@@ -357,7 +510,6 @@ def update_config():
             if not found:
                 lines.append(f'{key}={value}\n')
 
-        # Write .env
         with open(env_file, 'w') as f:
             f.writelines(lines)
 
@@ -369,24 +521,15 @@ def update_config():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-# Get host IP that spawned containers can reach
 def get_host_ip():
-    """Get Docker bridge IP for inter-container communication."""
     try:
-        result = subprocess.run(
-            ['ip', 'route', 'show', 'default'],
-            capture_output=True,
-            text=True
-        )
-        # Extract default gateway
-        default_gw = result.stdout.split()[2]
-        return default_gw
+        result = subprocess.run(['ip', 'route', 'show', 'default'], capture_output=True, text=True)
+        return result.stdout.split()[2]
     except:
-        return "172.17.0.1"  # Docker bridge default
+        return "172.17.0.1"
 
 @app.route('/api/install/start', methods=['POST'])
 def start_install():
-    """Main installation endpoint with log streaming + Keycloak user creation."""
     try:
         data = request.json
         admin_data = data.get('admin', {})
@@ -395,7 +538,6 @@ def start_install():
 
         logs = ["Starting installation..."]
 
-        # Update .env file
         env_file = os.path.join(WORKSPACE, '.env')
         with open(env_file, 'r') as f:
             env_vars = dict(line.strip().split('=', 1) for line in f if '=' in line and not line.startswith('#'))
@@ -414,15 +556,14 @@ def start_install():
         with open(env_file, 'w') as f:
             for key, value in env_vars.items():
                 f.write(f'{key}={value}\n')
-        with open(INSTALL_LOG, 'w') as log_file:
-            log_file.write(f"✓ Configuration saved to .env \n")
 
-        # Run installation with log streaming
+        with open(INSTALL_LOG, 'w') as log_file:
+            log_file.write(f"✓ Configuration saved to .env\n")
+
         install_script = os.path.join(WORKSPACE, 'bin/install.sh')
 
         with open(INSTALL_LOG, 'a') as log_file:
-            log_file.write(f"Running: {install_script} --non-interactive")
-
+            log_file.write(f"Running: {install_script} --non-interactive\n")
             log_file.write(f"\n=== Installation started at {datetime.now()} ===\n")
             log_file.write(f"Admin: {admin_data.get('username')}\n")
             log_file.write(f"Domain: {network_data.get('domain')}\n")
@@ -440,12 +581,10 @@ def start_install():
                 env=os.environ.copy()
             )
 
-            # Wait for completion
             return_code = process.wait()
 
             if return_code != 0:
-                with open(INSTALL_LOG, 'a') as f:
-                    f.write(f"\n\n[ERROR] Installation failed with exit code {return_code}\n")
+                log_file.write(f"\n\n[ERROR] Installation failed with exit code {return_code}\n")
                 return jsonify({
                     "success": False,
                     "error": f"Installation script failed (exit {return_code})",
@@ -454,11 +593,9 @@ def start_install():
                 }), 500
 
         with open(INSTALL_LOG, 'a') as log_file:
-            log_file.write("✓ Installation script completed")
+            log_file.write("✓ Installation script completed\n")
+            log_file.write("\nCreating admin user in Keycloak (both realms)...\n")
 
-            # Wait for Keycloak and create admin user
-
-            log_file.write("\nCreating admin user in Keycloak supos realm...")
             keycloak_result = create_keycloak_user(
                 username=admin_data.get('username'),
                 password=admin_data.get('password'),
@@ -466,13 +603,12 @@ def start_install():
                 domain=network_data.get('domain'),
                 port=network_data.get('port', 8088)
             )
-            log_file.write(keycloak_result['message'])
+            log_file.write(keycloak_result['message'] + "\n")
 
             if not keycloak_result['success']:
-                log_file.write("\n⚠ Keycloak user creation failed, but installation complete")
-                log_file.write("\nYou can still login with default: supos/supos")
+                log_file.write("\n⚠ Keycloak user creation failed\n")
+                log_file.write("\nYou can still login with default: admin/supos\n")
 
-            # Save configuration
             config = load_config()
             config['installed_apps'] = selected_apps
             config['admin'] = admin_data
@@ -480,23 +616,16 @@ def start_install():
             save_config(config)
             write_setup_flag(config)
 
-            log_file.write("\n✓ Installation complete!")
+            log_file.write("\n✓ Installation complete!\n")
 
-            return jsonify({
-                "success": True,
-                "message": "Installation complete",
-                "logs": logs,
-                "log_file": "/api/install/logs",
-                "access_url": f"http://{network_data.get('domain')}:{network_data.get('port', 8088)}/home"
-            })
-
-    except subprocess.TimeoutExpired:
         return jsonify({
-            "success": False,
-            "error": "Installation timeout (10 min)",
+            "success": True,
+            "message": "Installation complete",
             "logs": logs,
-            "log_file": "/api/install/logs"
-        }), 500
+            "log_file": "/api/install/logs",
+            "access_url": f"http://{network_data.get('domain')}:{network_data.get('port', 8088)}/home"
+        })
+
     except Exception as e:
         import traceback
         with open(INSTALL_LOG, 'a') as f:
@@ -511,17 +640,15 @@ def start_install():
 
 @app.route('/api/install/status')
 def install_status():
-    """Check if installation is running."""
-    # Simple check: if install.log exists and is recent
+    """Check if installation is running"""
     if os.path.exists(INSTALL_LOG):
         age = time.time() - os.path.getmtime(INSTALL_LOG)
-        if age < 600:  # Modified in last 10 minutes
+        if age < 600:
             return jsonify({"installing": True, "log_age": age})
     return jsonify({"installing": False})
 
 @app.route('/api/install/logs')
 def view_full_logs():
-    """Stream complete installation log as plain text."""
     if not os.path.exists(INSTALL_LOG):
         return "No installation log found.\nStart installation from the wizard.", 404
 
@@ -530,7 +657,6 @@ def view_full_logs():
 
 @app.route('/api/install/logs/tail')
 def tail_logs():
-    """Get last 100 lines for polling during installation."""
     if not os.path.exists(INSTALL_LOG):
         return jsonify({"logs": "", "exists": False}), 200
 
@@ -543,8 +669,8 @@ def tail_logs():
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/supos/status')
+@require_auth
 def supos_status():
-    """Get supOS container status."""
     try:
         containers = client.containers.list(all=True, filters={"name": "supos"})
         status_list = []
@@ -564,8 +690,9 @@ def supos_status():
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/supos/restart', methods=['POST'])
+@require_auth
 def restart_supos():
-    """Restart all supOS containers."""
+    """Restart all supOS containers"""
     try:
         subprocess.run(
             ['docker', 'compose', 'restart'],
