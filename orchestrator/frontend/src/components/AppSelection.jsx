@@ -1,16 +1,16 @@
 import { useState, useEffect } from 'react';
-import { Button, Space, Typography, Card, Checkbox, Row, Col, Alert } from 'antd';
-import { AppstoreOutlined } from '@ant-design/icons';
+import { Button, Space, Typography, Card, Row, Col, Alert, Badge, Tooltip } from 'antd';
+import { AppstoreOutlined, LockOutlined } from '@ant-design/icons';
 import axios from 'axios';
 
-const { Title, Text, Paragraph } = Typography;
-
+const { Title, Text } = Typography;
 import { API_BASE } from '../config';
 
 function AppSelection({ selectedApps, onComplete, onBack }) {
   const [apps, setApps] = useState([]);
   const [selected, setSelected] = useState(selectedApps || []);
   const [loading, setLoading] = useState(true);
+  const [resourceSpec, setResourceSpec] = useState('1'); // '1'=4c8g, '2'=8c16g
 
   useEffect(() => {
     fetchApps();
@@ -19,100 +19,117 @@ function AppSelection({ selectedApps, onComplete, onBack }) {
   const fetchApps = async () => {
     try {
       const response = await axios.get(`${API_BASE}/apps/list`);
-      setApps(response.data.apps || []);
+      const data = response.data;
+
+      // Merge all apps (base + extended)
+      const allApps = data.apps || [];
+      setApps(allApps);
+      setResourceSpec(data.resource_spec || '1');
     } catch (error) {
       console.error('Failed to fetch apps:', error);
-      // Fallback apps if API fails
+      // Fallback: all apps shown, some disabled
       setApps([
-        { id: 'grafana', name: 'Grafana', description: 'Metrics visualization and dashboards', icon: '📊' },
-        { id: 'minio', name: 'MinIO', description: 'Object storage (S3 compatible)', icon: '🗄️' },
-        { id: 'portainer', name: 'Portainer', description: 'Docker container management', icon: '🐳' },
-        { id: 'chat2db', name: 'Chat2DB', description: 'Database client with AI', icon: '💬' }
+        { id: 'grafana', name: 'Grafana', description: 'Metrics visualization', icon: '📊' },
+        { id: 'minio', name: 'MinIO', description: 'Object storage', icon: '🗄️' },
+        { id: 'mcpclient', name: 'MCP Client', description: 'AI integrations', icon: '🤖' },
+        { id: 'elk', name: 'ELK Stack', description: 'Log analytics', icon: '🔍', requires_high_resource: true },
+        { id: 'gitea', name: 'Gitea', description: 'Git service', icon: '🔀', requires_high_resource: true }
       ]);
     } finally {
       setLoading(false);
     }
   };
 
-  const handleToggle = (appId) => {
-    setSelected(prev => 
-      prev.includes(appId) 
-        ? prev.filter(id => id !== appId)
-        : [...prev, appId]
-    );
+  const isAppAvailable = (app) => {
+    // 8c16g-only apps unavailable in 4c8g mode
+    return !(resourceSpec === '1' && app.requires_high_resource);
   };
 
-  const handleContinue = () => {
-    onComplete(selected);
+  const handleToggle = (app) => {
+    if (!isAppAvailable(app)) return; // Disabled apps don't toggle
+
+    setSelected(prev =>
+      prev.includes(app.id)
+        ? prev.filter(id => id !== app.id)
+        : [...prev, app.id]
+    );
   };
 
   return (
     <div>
       <Title level={3}>Select Optional Apps</Title>
       <Text type="secondary">
-        Choose additional services to install alongside supOS platform
+        Choose additional services alongside supOS platform
       </Text>
 
       <Alert
-        message="Core services will be installed automatically"
-        description="PostgreSQL, Keycloak, EMQX, Kong, Backend, Frontend, and Node-RED are always included"
+        message="Core services install automatically"
+        description="PostgreSQL, Keycloak, EMQX, Kong, Backend, Frontend, Node-RED, Portainer, Chat2DB, TDengine"
         type="info"
         showIcon
         style={{ margin: '20px 0' }}
       />
 
       <Row gutter={[16, 16]} style={{ marginTop: 30 }}>
-        {apps.map(app => (
-          <Col xs={24} sm={12} key={app.id}>
+        {apps.map(app => {
+          const available = isAppAvailable(app);
+          const isSelected = selected.includes(app.id);
+
+          const card = (
             <Card
-              hoverable
-              onClick={() => handleToggle(app.id)}
+              hoverable={available}
+              onClick={() => available && handleToggle(app)}
               style={{
-                border: selected.includes(app.id) ? '2px solid #1890ff' : '1px solid #d9d9d9',
-                cursor: 'pointer'
+                border: isSelected ? '2px solid #1890ff' : '1px solid #d9d9d9',
+                cursor: available ? 'pointer' : 'not-allowed',
+                opacity: available ? 1 : 0.5,
+                backgroundColor: available ? '#fff' : '#f5f5f5'
               }}
             >
-              <Space direction="vertical" style={{ width: '100%' }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <Space>
-                    <span style={{ fontSize: 24 }}>{app.icon}</span>
-                    <Text strong style={{ fontSize: 16 }}>{app.name}</Text>
-                  </Space>
-                  <Checkbox checked={selected.includes(app.id)} />
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <div style={{ fontSize: 32, filter: available ? 'none' : 'grayscale(1)' }}>
+                  {app.icon}
                 </div>
-                <Paragraph type="secondary" style={{ margin: 0 }}>
-                  {app.description}
-                </Paragraph>
-              </Space>
+                <div style={{ flex: 1 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <Text strong style={{ color: available ? undefined : '#999' }}>
+                      {app.name}
+                    </Text>
+                    {!available && <LockOutlined style={{ color: '#999' }} />}
+                    {app.requires_high_resource && (
+                      <Badge count="8c16g only" style={{ backgroundColor: '#faad14' }} />
+                    )}
+                  </div>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    {app.description}
+                  </Text>
+                </div>
+              </div>
             </Card>
-          </Col>
-        ))}
+          );
+
+          return (
+            <Col xs={24} sm={12} key={app.id}>
+              {available ? card : (
+                <Tooltip title="Requires 8c16g resource spec. Unavailable in 4c8g mode.">
+                  {card}
+                </Tooltip>
+              )}
+            </Col>
+          );
+        })}
       </Row>
 
-      {selected.length > 0 && (
-        <Alert
-          message={`${selected.length} optional app${selected.length > 1 ? 's' : ''} selected`}
-          type="success"
-          showIcon
-          style={{ margin: '20px 0' }}
-        />
-      )}
-
-      <div style={{ marginTop: 40 }}>
-        <Space>
-          <Button onClick={onBack}>
-            Back
-          </Button>
-          <Button type="primary" onClick={handleContinue} size="large">
-            Continue
-          </Button>
-          {selected.length === 0 && (
-            <Text type="secondary" style={{ marginLeft: 10 }}>
-              (Skip optional apps)
-            </Text>
-          )}
-        </Space>
-      </div>
+      <Space style={{ marginTop: 30 }}>
+        <Button onClick={onBack}>Back</Button>
+        <Button
+          type="primary"
+          onClick={() => onComplete(selected)}
+          icon={<AppstoreOutlined />}
+        >
+          Continue with {selected.length} app{selected.length !== 1 ? 's' : ''}
+        </Button>
+      </Space>
     </div>
   );
 }

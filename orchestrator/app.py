@@ -123,6 +123,80 @@ def auth_status():
         'setup_complete': is_setup_complete()
     })
 
+@app.route('/api/apps/list')
+def list_apps():
+    """Return available optional apps based on OS_RESOURCE_SPEC"""
+    try:
+        env_file = os.path.join(WORKSPACE, '.env')
+        resource_spec = '2'  # Default to 8c16g
+
+        if os.path.exists(env_file):
+            with open(env_file, 'r') as f:
+                for line in f:
+                    if line.startswith('OS_RESOURCE_SPEC='):
+                        resource_spec = line.strip().split('=')[1]
+                        break
+
+        # Base apps available in both specs
+        base_apps = [
+            {
+                'id': 'grafana',
+                'name': 'Grafana',
+                'description': 'Metrics visualization and monitoring dashboards',
+                'icon': '📊',
+                'category': 'monitoring'
+            },
+            {
+                'id': 'minio',
+                'name': 'MinIO',
+                'description': 'S3-compatible object storage for data and backups',
+                'icon': '🗄️',
+                'category': 'storage'
+            },
+            {
+                'id': 'mcpclient',
+                'name': 'MCP Client',
+                'description': 'Model Context Protocol client for AI integrations',
+                'icon': '🤖',
+                'category': 'ai'
+            }
+        ]
+
+        # Extended apps only for 8c16g (high resource)
+        extended_apps = [
+            {
+                'id': 'elk',
+                'name': 'ELK Stack',
+                'description': 'Elasticsearch, Logstash, Kibana for log analytics',
+                'icon': '🔍',
+                'category': 'logging',
+                'requires_high_resource': True
+            },
+            {
+                'id': 'gitea',
+                'name': 'Gitea',
+                'description': 'Self-hosted Git service for version control',
+                'icon': '🔀',
+                'category': 'devops',
+                'requires_high_resource': True
+            }
+        ]
+
+        # ALWAYS return all apps - frontend handles grey-out
+        apps = base_apps + extended_apps
+
+        return jsonify({
+            'apps': apps,
+            'resource_spec': resource_spec,
+            'spec_name': '8c16g (High Resource)' if resource_spec == '2' else '4c8g (Standard)'
+        })
+
+    except Exception as e:
+        return jsonify({
+            'apps': [],
+            'error': str(e)
+        }), 500
+
 # ==================== KEYCLOAK USER MANAGEMENT ====================
 
 def create_keycloak_user(username, password, email, domain, port):

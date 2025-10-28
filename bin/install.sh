@@ -34,31 +34,40 @@ source "$SCRIPT_DIR/deb/install-docker.sh"
 
 # --- 4. Service Profile Selection ---
 if [[ "$NON_INTERACTIVE" == true ]]; then
-    # Read profiles from orchestrator selection
-    SELECTED_PROFILES=${SELECTED_PROFILES:-"grafana"}
-    info "Non-interactive mode: selected profiles=$SELECTED_PROFILES"
-    
+    SELECTED_PROFILES=${SELECTED_PROFILES:-""}
+    info "Non-interactive mode: selected profiles='$SELECTED_PROFILES'"
+
     # Convert to profile args
     profileCommand=""
     activeServices="emqx,nodered,keycloak,kong,postgresql,chat2db,portainer,tsdb"
-    
-    IFS=',' read -ra PROFILES <<< "$SELECTED_PROFILES"
-    for profile in "${PROFILES[@]}"; do
-        profileCommand+="--profile $profile "
-        activeServices+=",$profile"
-    done
-    
+
+    # Only add profiles if SELECTED_PROFILES is not empty
+    if [[ -n "$SELECTED_PROFILES" ]]; then
+        IFS=',' read -ra PROFILES <<< "$SELECTED_PROFILES"
+        for profile in "${PROFILES[@]}"; do
+            if [[ -n "$profile" ]]; then  # Skip empty strings
+                profileCommand+="--profile $profile "
+                activeServices+=",$profile"
+            fi
+        done
+    fi
+
     # Save to active-services.txt
     OUTPUT_FILE=$SCRIPT_DIR/global/active-services.txt
     mkdir -p "$(dirname "$OUTPUT_FILE")"
     echo "$activeServices" > "$OUTPUT_FILE"
     echo "$profileCommand" >> "$OUTPUT_FILE"
-    
+
     # Set COMPOSE_PROFILE_ARGS for docker compose
     COMPOSE_PROFILE_ARGS=()
-    for profile in "${PROFILES[@]}"; do
-        COMPOSE_PROFILE_ARGS+=("--profile" "$profile")
-    done
+    if [[ -n "$SELECTED_PROFILES" ]]; then
+        IFS=',' read -ra PROFILES <<< "$SELECTED_PROFILES"
+        for profile in "${PROFILES[@]}"; do
+            if [[ -n "$profile" ]]; then
+                COMPOSE_PROFILE_ARGS+=("--profile" "$profile")
+            fi
+        done
+    fi
 else
     # Interactive mode: original behavior
     source "$SCRIPT_DIR/util/select-service-profile.sh"
