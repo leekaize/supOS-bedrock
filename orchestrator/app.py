@@ -15,7 +15,15 @@ from flask_cors import CORS
 from functools import wraps
 
 app = Flask(__name__, static_folder='static', static_url_path='')
-app.secret_key = os.environ.get('FLASK_SECRET_KEY', os.urandom(24).hex())
+SECRET_KEY_FILE = '/app/config/secret.key'
+if os.path.exists(SECRET_KEY_FILE):
+    with open(SECRET_KEY_FILE, 'r') as f:
+        app.secret_key = f.read().strip()
+else:
+    app.secret_key = os.urandom(24).hex()
+    os.makedirs(os.path.dirname(SECRET_KEY_FILE), exist_ok=True)
+    with open(SECRET_KEY_FILE, 'w') as f:
+        f.write(app.secret_key)
 CORS(app, supports_credentials=True)
 
 # Paths
@@ -52,7 +60,7 @@ def require_auth(f):
 
 @app.route('/login')
 def login_page():
-    """Redirect to Keycloak"""
+    """Redirect to Keycloak supos realm"""
     if not is_setup_complete():
         return redirect('/')
 
@@ -60,35 +68,35 @@ def login_page():
     domain = config.get('network', {}).get('domain', '127.0.0.1')
     port = config.get('network', {}).get('port', 8088)
 
-    keycloak_auth = f"http://{domain}:{port}/keycloak/home/auth/realms/master/protocol/openid-connect/auth"
+    keycloak_auth = f"http://{domain}:{port}/keycloak/home/auth/realms/supos/protocol/openid-connect/auth"
     callback = f"http://{domain}:8080/auth/callback"
 
     return redirect(
         f"{keycloak_auth}?"
-        f"client_id=admin-cli&"
+        f"client_id=supos&"
         f"redirect_uri={callback}&"
         f"response_type=code&"
         f"scope=openid"
     )
 
+
 @app.route('/auth/callback')
 def auth_callback():
-    """OAuth callback"""
+    """OAuth callback - supos realm"""
     code = request.args.get('code')
     if not code:
         return jsonify({'error': 'No authorization code'}), 400
 
     config = load_config()
     domain = config.get('network', {}).get('domain', '127.0.0.1')
-
-    # Use Docker bridge to reach keycloak exposed port
-    token_url = "http://172.17.0.1:8081/realms/master/protocol/openid-connect/token"
+    token_url = "http://172.17.0.1:8081/realms/supos/protocol/openid-connect/token"
     callback = f"http://{domain}:8080/auth/callback"
 
     try:
         token_resp = requests.post(token_url, data={
             'grant_type': 'authorization_code',
-            'client_id': 'admin-cli',
+            'client_id': 'supos',
+            'client_secret': 'VaOS2makbDhJJsLlYPt4Wl87bo9VzXiO',
             'code': code,
             'redirect_uri': callback
         }, timeout=10)
@@ -99,7 +107,7 @@ def auth_callback():
         access_token = token_resp.json().get('access_token')
 
         userinfo_resp = requests.get(
-            "http://172.17.0.1:8081/realms/master/protocol/openid-connect/userinfo",
+            "http://172.17.0.1:8081/realms/supos/protocol/openid-connect/userinfo",
             headers={'Authorization': f'Bearer {access_token}'},
             timeout=10
         )
@@ -494,10 +502,12 @@ def configure_keycloak_orchestrator_client(domain, port=8088):
         if orchestrator_origin not in web_origins:
             web_origins.append(orchestrator_origin)
 
-        # Update client
+        # Update client - CRITICAL: Enable standard flow for OAuth
         client_config["redirectUris"] = redirect_uris
         client_config["webOrigins"] = web_origins
-        client_config["publicClient"] = True  # No client secret needed
+        client_config["standardFlowEnabled"] = True
+        client_config["directAccessGrantsEnabled"] = True
+        client_config["publicClient"] = False
 
         update_resp = requests.put(
             f"{keycloak_url}/admin/realms/master/clients/{client_uuid}",
@@ -519,6 +529,94 @@ def configure_keycloak_orchestrator_client(domain, port=8088):
 
     except Exception as e:
         return {"success": False, "message": f"Keycloak client config error: {str(e)}"}
+
+def configure_supos_client_callback(domain, port=8088):
+    """Configure supos client in supos realm with orchestrator callback"""
+    keycloak_url = "http://172.17.0.1:8081"
+    orchestrator_callback = f"http://{domain}:8080/auth/callback"
+    supos_callback = f"http://{domain}:{port}/inter-api/supos/auth/token"
+
+    try:
+        # Get admin token from master realm
+        token_resp = requests.post(
+            f"{keycloak_url}/realms/master/protocol/openid-connect/token",
+            data={
+                "client_id": "admin-cli",
+                "username": "admin",
+                "password": "supos",
+                "grant_type": "password"
+            },
+            timeout=10
+        )
+
+        if token_resp.status_code != 200:
+            return {"success": False, "message": f"Token error: {token_resp.text}"}
+
+        token = token_resp.json()["access_token"]
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+
+        # Get supos client from supos realm (NOT master)
+        clients_resp = requests.get(
+            f"{keycloak_url}/admin/realms/supos/clients?clientId=supos",
+            headers=headers,
+            timeout=10
+        )
+
+        if clients_resp.status_code != 200:
+            return {"success": False, "message": f"Client query failed: {clients_resp.text}"}
+
+        clients = clients_resp.json()
+        if not clients:
+            return {"success": False, "message": "supos client not found in supos realm"}
+
+        client_uuid = clients[0]["id"]
+
+        # Get current config
+        config_resp = requests.get(
+            f"{keycloak_url}/admin/realms/supos/clients/{client_uuid}",
+            headers=headers,
+            timeout=10
+        )
+
+        if config_resp.status_code != 200:
+            return {"success": False, "message": f"Config fetch failed: {config_resp.text}"}
+
+        client_config = config_resp.json()
+
+        # Update redirect URIs
+        redirect_uris = client_config.get("redirectUris", [])
+        new_uris = [
+            orchestrator_callback,
+            f"http://{domain}:8080/*",
+            supos_callback,
+            f"http://{domain}:{port}/*"
+        ]
+
+        for uri in new_uris:
+            if uri not in redirect_uris:
+                redirect_uris.append(uri)
+
+        client_config["redirectUris"] = redirect_uris
+
+        # Apply update to supos client in supos realm
+        update_resp = requests.put(
+            f"{keycloak_url}/admin/realms/supos/clients/{client_uuid}",
+            headers=headers,
+            json=client_config,
+            timeout=10
+        )
+
+        if update_resp.status_code not in [200, 204]:
+            return {"success": False, "message": f"Update failed: {update_resp.status_code} - {update_resp.text}"}
+
+        return {"success": True, "message": f"✓ supos client configured: {orchestrator_callback}, {supos_callback}"}
+
+    except Exception as e:
+        import traceback
+        return {"success": False, "message": f"Exception: {traceback.format_exc()}"}
 
 # ==================== CONFIG MANAGEMENT ====================
 
@@ -555,10 +653,8 @@ def write_setup_flag(config):
 # ==================== ROUTES ====================
 
 @app.route('/')
-@require_auth
 def index():
-    if is_setup_complete():
-        return jsonify({"message": "Setup complete", "redirect": "/api/supos/status"}), 200
+    """Serve React app - auth handled by @require_auth in React"""
     return send_from_directory('static', 'index.html')
 
 @app.route('/<path:path>')
@@ -705,13 +801,44 @@ def update_config():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+# =============== ORCHESTRATOR ROUTES ========================
+
+@app.route('/api/supos/container/<container_id>/<action>', methods=['POST'])
+@require_auth
+def container_action(container_id, action):
+    """Start/stop/restart container"""
+    if action not in ['start', 'stop', 'restart']:
+        return jsonify({"error": "Invalid action"}), 400
+
+    try:
+        container = client.containers.get(container_id)
+        getattr(container, action)()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/supos/backup', methods=['POST'])
+@require_auth
+def create_backup():
+    """Backup volumes and config"""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup_dir = f"/workspace/backups/backup_{timestamp}"
+    os.makedirs(backup_dir, exist_ok=True)
+
+    subprocess.run(['cp', '-r', '/workspace/mount', backup_dir], check=True)
+    volumes_path = os.getenv('VOLUMES_PATH', '/volumes/supos/data')
+    subprocess.run(['tar', '-czf', f"{backup_dir}/volumes.tar.gz", volumes_path])
+
+    return jsonify({"success": True, "backup_path": backup_dir})
+
+
+
 def get_host_ip():
     try:
         result = subprocess.run(['ip', 'route', 'show', 'default'], capture_output=True, text=True)
         return result.stdout.split()[2]
     except:
         return "172.17.0.1"
-
 
 # ===================== INSTALLATION =======================
 def sanitize_log_line(line):
@@ -807,6 +934,13 @@ def run_installation_async(admin_data, network_data, selected_apps):
                 port=network_data.get('port', 8088)
             )
             log_file.write(keycloak_result['message'] + "\n")
+
+            log_file.write("\nConfiguring supos client for orchestrator...\n")
+            supos_result = configure_supos_client_callback(
+                domain=network_data.get('domain'),
+                port=network_data.get('port', 8088)
+            )
+            log_file.write(supos_result['message'] + "\n")
 
             log_file.write("\nConfiguring orchestrator OAuth callback...\n")
             oauth_result = configure_keycloak_orchestrator_client(
@@ -960,15 +1094,30 @@ def tail_logs():
 @require_auth
 def supos_status():
     try:
-        containers = client.containers.list(all=True, filters={"name": "supos"})
+        # List ALL containers, filter in Python
+        all_containers = client.containers.list(all=True)
         status_list = []
 
-        for container in containers:
-            status_list.append({
-                "name": container.name,
-                "status": container.status,
-                "id": container.short_id
-            })
+        # Containers to include
+        include_patterns = [
+            'supos', 'frontend', 'backend', 'keycloak', 'postgres',
+            'emqx', 'nodered', 'tdengine', 'grafana', 'minio',
+            'elasticsearch', 'portainer', 'eventflow'
+        ]
+
+        for container in all_containers:
+            name_lower = container.name.lower()
+            if any(pattern in name_lower for pattern in include_patterns):
+                # Extract version
+                image = container.image.tags[0] if container.image.tags else "unknown"
+                version = image.split(':')[-1] if ':' in image else "latest"
+
+                status_list.append({
+                    "name": container.name,
+                    "status": container.status,
+                    "version": version,
+                    "id": container.short_id
+                })
 
         return jsonify({
             "containers": status_list,

@@ -1,11 +1,13 @@
 import { useState, useEffect } from 'react';
-import { ConfigProvider, theme as antTheme, Steps, Button, Card, Result } from 'antd';
-import { CheckCircleOutlined } from '@ant-design/icons';
+import { ConfigProvider, theme as antTheme, Steps, Button, Card, Result, Spin } from 'antd';
+import { CheckCircleOutlined, DashboardOutlined } from '@ant-design/icons';
 import SystemValidation from './components/SystemValidation';
 import AdminForm from './components/AdminForm';
 import AppSelection from './components/AppSelection';
 import Installation from './components/Installation';
+import ContainerManager from './components/ContainerManager';
 import './App.css';
+import { API_BASE } from './config';
 
 function App() {
   const [current, setCurrent] = useState(0);
@@ -14,8 +16,10 @@ function App() {
   const [selectedApps, setSelectedApps] = useState([]);
   const [setupComplete, setSetupComplete] = useState(false);
   const [dashboardUrl, setDashboardUrl] = useState('http://localhost:8088/home');
+  const [showInstallSuccess, setShowInstallSuccess] = useState(false);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
 
-  // Detect system theme
   const [isDark, setIsDark] = useState(
     window.matchMedia('(prefers-color-scheme: dark)').matches
   );
@@ -25,6 +29,38 @@ function App() {
     const handler = (e) => setIsDark(e.matches);
     mediaQuery.addEventListener('change', handler);
     return () => mediaQuery.removeEventListener('change', handler);
+  }, []);
+
+  // Single mount check
+  useEffect(() => {
+    const verifyState = async () => {
+      try {
+        const setupRes = await fetch(`${API_BASE}/setup/status`);
+        const setupData = await setupRes.json();
+
+        if (setupData.setup_complete) {
+          setSetupComplete(true);
+          const { domain, port } = setupData.config.network;
+          setDashboardUrl(`http://${domain}:${port}/home`);
+
+          // CRITICAL: Test actual protected endpoint, not just auth status
+          try {
+            const testRes = await fetch(`${API_BASE}/supos/status`, {
+              credentials: 'include'
+            });
+            setIsAuthenticated(testRes.ok); // 200 = auth works, 401 = needs login
+          } catch {
+            setIsAuthenticated(false);
+          }
+        }
+      } catch (err) {
+        console.error('State verification failed:', err);
+      } finally {
+        setAuthChecked(true);
+      }
+    };
+
+    verifyState();
   }, []);
 
   const steps = [
@@ -68,9 +104,9 @@ function App() {
       setDashboardUrl(accessUrl);
     }
     setSetupComplete(true);
+    setShowInstallSuccess(true);
   };
 
-  // supOS theme tokens
   const themeConfig = {
     algorithm: isDark ? antTheme.darkAlgorithm : antTheme.defaultAlgorithm,
     token: {
@@ -83,18 +119,52 @@ function App() {
     },
   };
 
-  if (setupComplete) {
+  // Block until checks complete
+  if (!authChecked) {
+    return (
+      <ConfigProvider theme={themeConfig}>
+        <div className="app-container" style={{ textAlign: 'center', paddingTop: '20%' }}>
+          <Spin size="large" />
+        </div>
+      </ConfigProvider>
+    );
+  }
+
+  // Require auth after setup
+  if (setupComplete && !isAuthenticated) {
+    window.location.href = '/login';
+    return null;
+  }
+
+  // Success page (one-time)
+  if (setupComplete && showInstallSuccess) {
     return (
       <ConfigProvider theme={themeConfig}>
         <div className="app-container">
           <Result
             status="success"
-            title="supOS-CE Ready"
-            subTitle="Setup complete. Redirecting to dashboard..."
+            title="Installation Complete"
+            subTitle="Your supOS industrial platform is ready"
             extra={[
-              <Button type="primary" key="dashboard" href={dashboardUrl}>
-                Go to Dashboard
+              <Button
+                type="primary"
+                size="large"
+                icon={<DashboardOutlined />}
+                href={dashboardUrl}
+                key="dashboard"
+              >
+                Open supOS Dashboard
               </Button>,
+              <Button
+                size="large"
+                onClick={() => {
+                  setShowInstallSuccess(false);
+                  window.location.href = '/login';
+                }}
+                key="orchestrator"
+              >
+                Manage Containers
+              </Button>
             ]}
           />
         </div>
@@ -102,6 +172,23 @@ function App() {
     );
   }
 
+  // Container management (authenticated)
+  if (setupComplete && isAuthenticated) {
+    return (
+      <ConfigProvider theme={themeConfig}>
+        <div className="app-container">
+          <div className="wizard-header">
+            <h1>supOS-bedrock</h1>
+          </div>
+          <Card className="wizard-card">
+            <ContainerManager />
+          </Card>
+        </div>
+      </ConfigProvider>
+    );
+  }
+
+  // Setup wizard
   return (
     <ConfigProvider theme={themeConfig}>
       <div className="app-container">
