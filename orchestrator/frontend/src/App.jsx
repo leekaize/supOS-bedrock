@@ -31,7 +31,7 @@ function App() {
     return () => mediaQuery.removeEventListener('change', handler);
   }, []);
 
-  // Single mount check
+  // FIX: Wait for auth session before testing protected endpoints
   useEffect(() => {
     const verifyState = async () => {
       try {
@@ -43,13 +43,23 @@ function App() {
           const { domain, port } = setupData.config.network;
           setDashboardUrl(`http://${domain}:${port}/home`);
 
-          // CRITICAL: Test actual protected endpoint, not just auth status
-          try {
-            const testRes = await fetch(`${API_BASE}/supos/status`, {
-              credentials: 'include'
-            });
-            setIsAuthenticated(testRes.ok); // 200 = auth works, 401 = needs login
-          } catch {
+          // FIX: Check auth status endpoint first (unprotected)
+          const authRes = await fetch(`${API_BASE}/auth/status`, {
+            credentials: 'include'
+          });
+
+          if (authRes.ok) {
+            const authData = await authRes.json();
+
+            if (authData.authenticated) {
+              // Session confirmed, now test protected endpoint with retry
+              const authenticated = await testProtectedEndpointWithRetry();
+              setIsAuthenticated(authenticated);
+            } else {
+              // Not authenticated, redirect to login
+              setIsAuthenticated(false);
+            }
+          } else {
             setIsAuthenticated(false);
           }
         }
@@ -62,6 +72,35 @@ function App() {
 
     verifyState();
   }, []);
+
+  // FIX: Retry logic for 401 errors (handles session cookie timing)
+  const testProtectedEndpointWithRetry = async (maxRetries = 3) => {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        const testRes = await fetch(`${API_BASE}/supos/status`, {
+          credentials: 'include'
+        });
+
+        if (testRes.ok) {
+          return true; // Success
+        }
+
+        if (testRes.status === 401 && attempt < maxRetries - 1) {
+          // Wait before retry (exponential backoff)
+          await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+          continue;
+        }
+
+        return false; // Failed after retries
+      } catch (err) {
+        console.error(`Attempt ${attempt + 1} failed:`, err);
+        if (attempt < maxRetries - 1) {
+          await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+        }
+      }
+    }
+    return false;
+  };
 
   const steps = [
     {
@@ -78,93 +117,79 @@ function App() {
     },
     {
       title: 'Installation',
+      icon: setupComplete ? <CheckCircleOutlined /> : null,
     },
   ];
 
-  const next = () => setCurrent(current + 1);
-  const prev = () => setCurrent(current - 1);
-
   const handleValidationComplete = (passed) => {
     setValidationPassed(passed);
-    if (passed) next();
+    if (passed) setCurrent(1);
   };
 
   const handleAdminComplete = (data) => {
     setAdminData(data);
-    next();
+    setCurrent(2);
   };
 
-  const handleAppSelection = (apps) => {
+  const handleAppSelectionComplete = (apps) => {
     setSelectedApps(apps);
-    next();
+    setCurrent(3);
   };
 
-  const handleInstallComplete = (accessUrl) => {
-    if (accessUrl) {
-      setDashboardUrl(accessUrl);
+  const handleInstallationComplete = (success) => {
+    if (success) {
+      setSetupComplete(true);
+      setShowInstallSuccess(true);
     }
-    setSetupComplete(true);
-    setShowInstallSuccess(true);
   };
 
-  const themeConfig = {
-    algorithm: isDark ? antTheme.darkAlgorithm : antTheme.defaultAlgorithm,
-    token: {
-      colorPrimary: '#1d77fe',
-      colorSuccess: '#24a148',
-      colorWarning: '#f1c21b',
-      colorError: '#da1e28',
-      fontFamily: "'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
-      borderRadius: 4,
-    },
-  };
-
-  // Block until checks complete
   if (!authChecked) {
     return (
-      <ConfigProvider theme={themeConfig}>
-        <div className="app-container" style={{ textAlign: 'center', paddingTop: '20%' }}>
-          <Spin size="large" />
+      <div style={{
+        display: 'flex',
+        justifyContent: 'center',
+        alignItems: 'center',
+        height: '100vh'
+      }}>
+        <Spin size="large" />
+      </div>
+    );
+  }
+
+  if (setupComplete && !isAuthenticated) {
+    return (
+      <ConfigProvider theme={{ algorithm: isDark ? antTheme.darkAlgorithm : antTheme.defaultAlgorithm }}>
+        <div className="App">
+          <Result
+            status="warning"
+            title="Authentication Required"
+            subTitle="Please log in to access the orchestrator"
+            extra={
+              <Button type="primary" href="/login">
+                Log In
+              </Button>
+            }
+          />
         </div>
       </ConfigProvider>
     );
   }
 
-  // Require auth after setup
-  if (setupComplete && !isAuthenticated) {
-    window.location.href = '/login';
-    return null;
-  }
-
-  // Success page (one-time)
-  if (setupComplete && showInstallSuccess) {
+  if (showInstallSuccess) {
     return (
-      <ConfigProvider theme={themeConfig}>
-        <div className="app-container">
+      <ConfigProvider theme={{ algorithm: isDark ? antTheme.darkAlgorithm : antTheme.defaultAlgorithm }}>
+        <div className="App">
           <Result
             status="success"
-            title="Installation Complete"
-            subTitle="Your supOS industrial platform is ready"
+            title="supOS-bedrock Installed!"
+            subTitle="Your platform is ready. Manage containers below or access the dashboard."
             extra={[
-              <Button
-                type="primary"
-                size="large"
-                icon={<DashboardOutlined />}
-                href={dashboardUrl}
-                key="dashboard"
-              >
+              <Button type="primary" icon={<DashboardOutlined />} href={dashboardUrl} target="_blank" key="dashboard">
                 Open supOS Dashboard
               </Button>,
-              <Button
-                size="large"
-                onClick={() => {
-                  setShowInstallSuccess(false);
-                  window.location.href = '/login';
-                }}
-                key="orchestrator"
-              >
+              <Button key="manage" onClick={() => setShowInstallSuccess(false)}>
                 Manage Containers
-              </Button>
+              </Button>,
             ]}
           />
         </div>
@@ -172,57 +197,38 @@ function App() {
     );
   }
 
-  // Container management (authenticated)
-  if (setupComplete && isAuthenticated) {
+  if (setupComplete) {
     return (
-      <ConfigProvider theme={themeConfig}>
-        <div className="app-container">
-          <div className="wizard-header">
-            <h1>supOS-bedrock</h1>
-          </div>
-          <Card className="wizard-card">
-            <ContainerManager />
-          </Card>
+      <ConfigProvider theme={{ algorithm: isDark ? antTheme.darkAlgorithm : antTheme.defaultAlgorithm }}>
+        <div className="App">
+          <ContainerManager dashboardUrl={dashboardUrl} />
         </div>
       </ConfigProvider>
     );
   }
 
-  // Setup wizard
   return (
-    <ConfigProvider theme={themeConfig}>
-      <div className="app-container">
-        <div className="wizard-header">
-          <h1>supOS-CE Setup</h1>
-          <p>Configure your industrial IoT platform in 4 steps</p>
-        </div>
+    <ConfigProvider theme={{ algorithm: isDark ? antTheme.darkAlgorithm : antTheme.defaultAlgorithm }}>
+      <div className="App">
+        <Card style={{ maxWidth: 1000, margin: '40px auto', padding: '20px' }}>
+          <Steps current={current} items={steps} style={{ marginBottom: 40 }} />
 
-        <Card className="wizard-card">
-          <Steps current={current} items={steps} className="wizard-steps" />
-
-          <div className="steps-content">
-            {current === 0 && (
-              <SystemValidation onComplete={handleValidationComplete} />
-            )}
-            {current === 1 && (
-              <AdminForm onComplete={handleAdminComplete} onBack={prev} />
-            )}
-            {current === 2 && (
-              <AppSelection
-                selectedApps={selectedApps}
-                onComplete={handleAppSelection}
-                onBack={prev}
-              />
-            )}
-            {current === 3 && (
-              <Installation
-                adminData={adminData}
-                selectedApps={selectedApps}
-                onComplete={handleInstallComplete}
-                onBack={prev}
-              />
-            )}
-          </div>
+          {current === 0 && <SystemValidation onComplete={handleValidationComplete} />}
+          {current === 1 && <AdminForm onComplete={handleAdminComplete} onBack={() => setCurrent(0)} />}
+          {current === 2 && (
+            <AppSelection
+              selectedApps={selectedApps}
+              onComplete={handleAppSelectionComplete}
+              onBack={() => setCurrent(1)}
+            />
+          )}
+          {current === 3 && (
+            <Installation
+              adminData={adminData}
+              selectedApps={selectedApps}
+              onComplete={handleInstallationComplete}
+            />
+          )}
         </Card>
       </div>
     </ConfigProvider>

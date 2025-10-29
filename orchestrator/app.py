@@ -9,12 +9,14 @@ import requests
 import docker
 import threading
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, send_from_directory, Response, redirect, session
 from flask_cors import CORS
 from functools import wraps
 
 app = Flask(__name__, static_folder='static', static_url_path='')
+
+# Session configuration
 SECRET_KEY_FILE = '/app/config/secret.key'
 if os.path.exists(SECRET_KEY_FILE):
     with open(SECRET_KEY_FILE, 'r') as f:
@@ -24,6 +26,16 @@ else:
     os.makedirs(os.path.dirname(SECRET_KEY_FILE), exist_ok=True)
     with open(SECRET_KEY_FILE, 'w') as f:
         f.write(app.secret_key)
+
+# FIX: Session configuration
+app.config.update(
+    SESSION_COOKIE_SECURE=False,  # True if using HTTPS
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=24),
+    SESSION_REFRESH_EACH_REQUEST=True  # Extend session on each request
+)
+
 CORS(app, supports_credentials=True)
 
 # Paths
@@ -45,15 +57,28 @@ def require_auth(f):
     """Protect routes ONLY after setup completes"""
     @wraps(f)
     def decorated(*args, **kwargs):
-        # During setup: no auth required
         if not is_setup_complete():
             return f(*args, **kwargs)
 
-        # After setup: check Keycloak session
+        # FIX: Check session validity
         if 'keycloak_user' not in session:
             if request.path.startswith('/api/'):
-                return jsonify({'error': 'Authentication required'}), 401
+                return jsonify({
+                    'error': 'Authentication required',
+                    'redirect': '/login'
+                }), 401
             return redirect('/login')
+
+        # FIX: Validate session timestamp (optional expiry check)
+        session_created = session.get('session_created_at')
+        if session_created:
+            created_time = datetime.fromisoformat(session_created)
+            if datetime.utcnow() - created_time > timedelta(hours=24):
+                session.clear()
+                return jsonify({
+                    'error': 'Session expired',
+                    'redirect': '/login'
+                }), 401
 
         return f(*args, **kwargs)
     return decorated
@@ -93,6 +118,8 @@ def auth_callback():
     callback = f"http://{domain}:8080/auth/callback"
 
     try:
+        import requests
+
         token_resp = requests.post(token_url, data={
             'grant_type': 'authorization_code',
             'client_id': 'supos',
@@ -114,8 +141,16 @@ def auth_callback():
 
         if userinfo_resp.status_code == 200:
             user = userinfo_resp.json()
+
+            # FIX: Set session with explicit permanent flag and timestamp
+            session.permanent = True
             session['keycloak_user'] = user.get('preferred_username', 'admin')
             session['access_token'] = access_token
+            session['session_created_at'] = datetime.utcnow().isoformat()
+
+            # FIX: Force session save
+            session.modified = True
+
             return redirect('/')
 
         return jsonify({'error': 'User info failed'}), 400
@@ -130,10 +165,23 @@ def logout():
 
 @app.route('/api/auth/status')
 def auth_status():
+    """FIX: Enhanced auth status endpoint (unprotected for health checks)"""
+    is_authenticated = 'keycloak_user' in session
+    user = session.get('keycloak_user')
+
+    # Check session age
+    session_age_seconds = None
+    session_created = session.get('session_created_at')
+    if session_created:
+        created_time = datetime.fromisoformat(session_created)
+        session_age_seconds = (datetime.utcnow() - created_time).total_seconds()
+
     return jsonify({
-        'authenticated': 'keycloak_user' in session,
-        'user': session.get('keycloak_user'),
-        'setup_complete': is_setup_complete()
+        'authenticated': is_authenticated,
+        'user': user,
+        'setup_complete': is_setup_complete(),
+        'session_age_seconds': session_age_seconds,
+        'session_expires_in_hours': 24 - (session_age_seconds / 3600) if session_age_seconds else None
     })
 
 @app.route('/api/apps/list')
@@ -385,19 +433,19 @@ def create_keycloak_user(username, password, email, domain, port):
             return {"success": False, "message": f"Master role assignment failed: {master_assign.status_code}"}
 
         # === DELETE DEFAULTS ===
-        # Delete supos user
-        default_supos = requests.get(
-            f"{keycloak_url}/admin/realms/supos/users?username=supos&exact=true",
-            headers=headers, timeout=10
-        )
-        if default_supos.status_code == 200:
-            for user in default_supos.json():
-                if user['username'] == 'supos':
-                    requests.delete(
-                        f"{keycloak_url}/admin/realms/supos/users/{user['id']}",
-                        headers=headers, timeout=10
-                    )
-                    break
+        # Delete supos user (Comment out due to BUG, might cause certain containers fail to restart)
+        # default_supos = requests.get(
+        #     f"{keycloak_url}/admin/realms/supos/users?username=supos&exact=true",
+        #     headers=headers, timeout=10
+        # )
+        # if default_supos.status_code == 200:
+        #     for user in default_supos.json():
+        #         if user['username'] == 'supos':
+        #             requests.delete(
+        #                 f"{keycloak_url}/admin/realms/supos/users/{user['id']}",
+        #                 headers=headers, timeout=10
+        #             )
+        #             break
 
         # Delete admin user (This still cause BUG where routes leads to 403)
         # default_admin = requests.get(
@@ -627,7 +675,10 @@ def load_config():
     return {
         "setup_complete": False,
         "admin": {},
-        "network": {"domain": os.getenv("ENTRANCE_DOMAIN", "127.0.0.1"), "port": int(os.getenv("ENTRANCE_PORT", 8088))},
+        "network": {
+            "domain": os.getenv("ENTRANCE_DOMAIN", "127.0.0.1"),
+            "port": int(os.getenv("ENTRANCE_PORT", 8088))
+        },
         "system": {"volumes_path": os.getenv("VOLUMES_PATH", "/volumes/supos/data")},
         "selected_apps": [],
         "installed_apps": []
@@ -942,12 +993,12 @@ def run_installation_async(admin_data, network_data, selected_apps):
             )
             log_file.write(supos_result['message'] + "\n")
 
-            log_file.write("\nConfiguring orchestrator OAuth callback...\n")
-            oauth_result = configure_keycloak_orchestrator_client(
-                domain=network_data.get('domain'),
-                port=network_data.get('port', 8088)
-            )
-            log_file.write(oauth_result['message'] + "\n")
+            # log_file.write("\nConfiguring orchestrator OAuth callback...\n")
+            # oauth_result = configure_keycloak_orchestrator_client(
+            #     domain=network_data.get('domain'),
+            #     port=network_data.get('port', 8088)
+            # )
+            # log_file.write(oauth_result['message'] + "\n")
 
             if not keycloak_result['success']:
                 log_file.write("\n⚠ Keycloak user creation failed\n")
@@ -1090,41 +1141,32 @@ def tail_logs():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ==================== PROTECTED ROUTES ====================
+
 @app.route('/api/supos/status')
 @require_auth
 def supos_status():
+    """Get status of supOS containers"""
     try:
-        # List ALL containers, filter in Python
-        all_containers = client.containers.list(all=True)
-        status_list = []
+        import docker
+        client = docker.from_env()
+        containers = []
 
-        # Containers to include
-        include_patterns = [
-            'supos', 'frontend', 'backend', 'keycloak', 'postgres',
-            'emqx', 'nodered', 'tdengine', 'grafana', 'minio',
-            'elasticsearch', 'portainer', 'eventflow'
-        ]
-
-        for container in all_containers:
-            name_lower = container.name.lower()
-            if any(pattern in name_lower for pattern in include_patterns):
-                # Extract version
-                image = container.image.tags[0] if container.image.tags else "unknown"
-                version = image.split(':')[-1] if ':' in image else "latest"
-
-                status_list.append({
-                    "name": container.name,
-                    "status": container.status,
-                    "version": version,
-                    "id": container.short_id
+        for container in client.containers.list(all=True):
+            if container.name not in ['supos-bedrock']:
+                containers.append({
+                    'id': container.id[:12],
+                    'name': container.name,
+                    'status': container.status,
+                    'image': container.image.tags[0] if container.image.tags else 'unknown'
                 })
 
         return jsonify({
-            "containers": status_list,
-            "count": len(status_list)
+            'containers': containers,
+            'timestamp': datetime.utcnow().isoformat()
         })
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/supos/restart', methods=['POST'])
 @require_auth
