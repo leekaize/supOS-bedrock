@@ -1,61 +1,88 @@
+/* ============================================
+   supOS Theme + Ant Design Native
+   ============================================ */
+
+/* ===== CSS Variables (supOS Colors Only) ===== */
 :root {
-  --primary-blue: #1890ff;
-  --dark-bg: #001529;
-  --gray-bg: #f0f2f5;
-  --border-color: #d9d9d9;
-  --text-primary: #262626;
-  --text-secondary: #8c8c8c;
+  --supos-theme-color: #1d77fe;
+  --supos-theme-color-rgb: 29, 119, 254;
+  --supos-theme-button-hover-color: #134fa9;
+  --supos-theme-button-active-color: #0f3c7f;
+  --supos-success-color: #24a148;
+  --supos-warning-color: #f1c21b;
+  --supos-error-color: #da1e28;
 }
 
+/* ===== Global Reset ===== */
 * {
   margin: 0;
   padding: 0;
   box-sizing: border-box;
 }
 
+/* ===== Scrollbar ===== */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  border-radius: 8px;
+  background: #d3d3d3;
+  cursor: pointer;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #a5a5a5;
+}
+
+::-webkit-scrollbar-track {
+  margin: 4px 0;
+  border-radius: 8px;
+}
+
+/* ===== Body ===== */
 body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  font-family: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   min-height: 100vh;
   padding: 20px;
 }
 
+/* ===== App Container ===== */
 .app-container {
   max-width: 1000px;
   margin: 0 auto;
   padding: 20px;
 }
 
+/* ===== Wizard Header ===== */
 .wizard-header {
   text-align: center;
   margin-bottom: 40px;
-  color: white;
 }
 
 .wizard-header h1 {
   font-size: 36px;
-  font-weight: 700;
+  font-weight: 600;
   margin-bottom: 10px;
-  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
 }
 
 .wizard-header p {
-  font-size: 18px;
-  opacity: 0.9;
+  font-size: 16px;
 }
 
+/* ===== Wizard Card ===== */
 .wizard-card {
-  background: white;
-  border-radius: 12px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+  border-radius: 8px;
   padding: 40px;
   min-height: 500px;
 }
 
+/* ===== Wizard Steps ===== */
 .wizard-steps {
   margin-bottom: 40px;
   padding-bottom: 20px;
-  border-bottom: 1px solid var(--border-color);
 }
 
 .steps-content {
@@ -63,59 +90,14 @@ body {
   padding: 20px 0;
 }
 
-/* Ant Design overrides for industrial theme */
-.ant-steps-item-process .ant-steps-item-icon {
-  background: var(--primary-blue);
-  border-color: var(--primary-blue);
-}
-
-.ant-steps-item-finish .ant-steps-item-icon {
-  background: #52c41a;
-  border-color: #52c41a;
-}
-
-.ant-btn-primary {
-  background: var(--primary-blue);
-  border-color: var(--primary-blue);
-  font-weight: 600;
-  height: 40px;
-  padding: 0 24px;
-}
-
-.ant-btn-primary:hover {
-  background: #40a9ff;
-  border-color: #40a9ff;
-}
-
-.ant-form-item-label > label {
-  font-weight: 600;
-  color: var(--text-primary);
-}
-
-.ant-input-affix-wrapper,
-.ant-input,
-.ant-input-password {
-  border-radius: 6px;
-}
-
-.ant-card {
-  border-radius: 8px;
-  transition: all 0.3s ease;
-}
-
-.ant-card:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-}
-
-/* Mobile responsive */
+/* ===== Mobile ===== */
 @media (max-width: 768px) {
   .wizard-header h1 {
     font-size: 28px;
   }
 
   .wizard-card {
-    padding: 20px;
+    padding: 24px 16px;
   }
 
   .steps-content {
@@ -123,31 +105,86 @@ body {
   }
 }
 
-/* Loading states */
-.ant-spin {
-  color: var(--primary-blue);
-}
-
-/* Terminal logs */
-code {
-  background: #f5f5f5;
-  padding: 2px 6px;
-  border-radius: 3px;
-  font-family: 'Courier New', monospace;
+/* ===== Terminal ===== */
+.terminal-container {
+  background: #000;
+  color: #0f0;
+  padding: 20px;
+  border-radius: 4px;
+  font-family: 'IBM Plex Mono', monospace;
   font-size: 13px;
+  max-height: 300px;
+  overflow-y: auto;
 }
 
-/* Success states */
-.ant-result-success .ant-result-icon > .anticon {
-  color: #52c41a;
+/* ===== Selection ===== */
+::selection {
+  background: var(--supos-theme-color);
+  color: #fff;
 }
 
-/* Progress bar */
-.ant-progress-line {
-  margin-bottom: 8px;
+::-webkit-selection {
+  background: var(--supos-theme-color);
+  color: #fff;
 }
 
-.ant-progress-success-bg,
-.ant-progress-bg {
-  background: linear-gradient(90deg, #1890ff, #52c41a);
+/* ===== Message ===== */
+.ant-message {
+  z-index: 9001;
+}
+
+/* ============================================
+   DARK MODE - Non-Ant Elements
+   ConfigProvider handles all Ant components
+   ============================================ */
+
+@media (prefers-color-scheme: dark) {
+
+  /* Root container */
+  body {
+    background-color: #161616 !important;
+    color: #ffffff;
+  }
+
+  .app-container {
+    background-color: #161616;
+  }
+
+  /* Wizard header */
+  .wizard-header h1,
+  .wizard-header p {
+    color: #ffffff;
+  }
+
+  /* Custom cards (non-Ant) */
+  .ant-card {
+    background: #262626;
+    border-color: #393939;
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar-thumb {
+    background: #6f6f6f;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: #8d8d8d;
+  }
+
+  /* AppSelection custom cards - override inline styles */
+  .ant-col .ant-card {
+    background: #262626 !important;
+    border-color: #393939 !important;
+  }
+
+  .ant-col .ant-card:hover {
+    background: #393939 !important;
+  }
+
+  /* AppSelection card text */
+  .ant-col .ant-card .ant-typography,
+  .ant-col .ant-card span,
+  .ant-col .ant-card div {
+    color: #ffffff !important;
+  }
 }

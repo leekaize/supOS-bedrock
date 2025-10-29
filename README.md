@@ -33,7 +33,7 @@ Then access through web browser: http://YOUR_SERVER_IP:8080
   - [x] System Check: Verify and suggest actions on volume, IP/domain and port.
   - [x] Admin Account: Set custom username, password and email. Used for supOS frontend and keycloak.
   - [x] Select Apps: Optional containers can be installed through GUI.
-  - [ ] Installation Logs: Show stages of installation with detailed logs.
+  - [x] Installation Logs: Show stages of installation with detailed logs.
 - [ ] GUI for system update recommendations
 - [ ] GUI for backup/restore
 
