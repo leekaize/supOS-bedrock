@@ -12,7 +12,8 @@ from routes import (
     install_bp,
     auth_routes_bp,
     container_bp,
-    version_bp
+    version_bp,
+    backup_bp
 )
 
 # Initialize Flask app
@@ -47,6 +48,7 @@ app.register_blueprint(install_bp)
 app.register_blueprint(auth_routes_bp)
 app.register_blueprint(container_bp)
 app.register_blueprint(version_bp)
+app.register_blueprint(backup_bp)
 
 # Static file routes
 @app.route('/')
@@ -69,6 +71,9 @@ def health():
         "status": "ok",
         "setup_complete": is_setup_complete()
     })
+
+from backup_scheduler import backup_scheduler
+backup_scheduler.load_schedule()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=False)

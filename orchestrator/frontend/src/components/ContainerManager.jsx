@@ -15,6 +15,7 @@ import {
 } from '@ant-design/icons';
 import { authAPI } from '../utils/authFetch';
 import { API_BASE } from '../config';
+import BackupRestoreModal from './BackupRestoreModal';
 
 const { Title, Text } = Typography;
 
@@ -27,6 +28,7 @@ function ContainerManager() {
     const [updateModal, setUpdateModal] = useState({ visible: false, container: null });
     const [uninstallModal, setUninstallModal] = useState({ visible: false, app: null });
     const [resourceSpec, setResourceSpec] = useState('2');
+    const [backupModal, setBackupModal] = useState(false);
 
     const fetchContainers = async () => {
         try {
@@ -210,27 +212,24 @@ function ContainerManager() {
     };
 
     const handleBackup = () => {
-        Modal.confirm({
-            title: 'Create Backup',
-            content: 'Backup all volumes and configuration?',
-            onOk: async () => {
-                setActionInProgress(true);
-                setActionMessage('Creating backup...');
+        setBackupModal(true);
+    };
 
-                try {
-                    const data = await authAPI.post('/supos/backup');
-                    if (data.success) {
-                        message.success(`Backup created: ${data.backup_path}`);
-                    }
-                } catch (err) {
-                    console.error('Backup error:', err);
-                    message.error('Backup failed');
-                } finally {
-                    setActionInProgress(false);
-                    setActionMessage('');
-                }
-            }
-        });
+    const handleRestore = async (archiveName) => {
+        setBackupModal(false);
+        setActionInProgress(true);
+        setActionMessage(`Restoring backup: ${archiveName}`);
+
+        try {
+            await authAPI.post('/backup/restore', { archive_name: archiveName });
+            message.success('Restore completed. Services restarting...');
+            setTimeout(() => window.location.reload(), 3000);
+        } catch (err) {
+            console.error('Restore error:', err);
+            message.error('Restore failed. Check logs.');
+            setActionInProgress(false);
+            setActionMessage('');
+        }
     };
 
     const openSuposDashboard = async () => {
@@ -552,6 +551,12 @@ function ContainerManager() {
                         </div>
                     )}
                 </Modal>
+
+                <BackupRestoreModal
+                    visible={backupModal}
+                    onCancel={() => setBackupModal(false)}
+                    onRestore={handleRestore}
+                />
             </div>
         </>
     );

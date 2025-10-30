@@ -33,7 +33,7 @@ Then access through web browser: http://YOUR_SERVER_IP:8080
 ## What it does
 
 - **Setup wizard** → Zero terminal config, admin created via UI
-- **Modular apps** → Install Grafana, MinIO, ELK post-deployment
+- **Modular apps** → Install Grafana, MinIO, ELK and other optional apps post-deployment
 - **Integrated app store** → Add capabilities without reinstall
 - **One-click updates** → Version management from UI
 - **Automated backups** → Database exports + config snapshots
@@ -46,12 +46,18 @@ Then access through web browser: http://YOUR_SERVER_IP:8080
   - [x] Admin Account: Set custom username, password and email. Used for supOS frontend and keycloak.
   - [x] Select Apps: Optional containers can be installed through GUI.
   - [x] Installation Logs: Show stages of installation with detailed logs.
-- [ ] GUI for orchestrator interface
+- [x] GUI for orchestrator interface
   - [x] Redirect to Keycloak for access
   - [x] Container version update recommendations
-  - [ ] Backup/restore functionality
+  - [x] Optional containers install/uninstall
+  - [x] Backup/restore functionality
 
-### v0.2 Roadmap (Ready for Production Use)
+### v0.2 Roadmap (Get Ready for Production Use)
 
-- [ ] Fix Bugs in GitHub Issue
+- [ ] Fix Bugs Listed in GitHub Issue
   - [ ] Implement proper disable/block for default admin, necessary for security.
+- [ ] Full-featured Backup/Restore
+  - [ ] Backup system/containers config
+- [ ] Implement within supOS-frontend
+  - [ ] Show update notifications through APIs
+  - [ ] Access orchestrator through homepage menu

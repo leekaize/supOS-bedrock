@@ -12,7 +12,7 @@ WORKDIR /app
 # System dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    curl gettext xz-utils git gcc python3-dev && \
+    curl gettext xz-utils git gcc python3-dev borgbackup && \
     rm -rf /var/lib/apt/lists/*
 
 # Docker CLI (architecture detection)
