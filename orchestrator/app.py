@@ -9,10 +9,12 @@ import requests
 import docker
 import threading
 import re
+import yaml
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, send_from_directory, Response, redirect, session
 from flask_cors import CORS
 from functools import wraps
+from packaging import version as pkg_version
 
 app = Flask(__name__, static_folder='static', static_url_path='')
 
@@ -27,18 +29,17 @@ else:
     with open(SECRET_KEY_FILE, 'w') as f:
         f.write(app.secret_key)
 
-# FIX: Session configuration
 app.config.update(
-    SESSION_COOKIE_SECURE=False,  # True if using HTTPS
+    SESSION_COOKIE_SECURE=False,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE='Lax',
     PERMANENT_SESSION_LIFETIME=timedelta(hours=24),
-    SESSION_REFRESH_EACH_REQUEST=True  # Extend session on each request
+    SESSION_REFRESH_EACH_REQUEST=True,
+    SESSION_COOKIE_NAME='orchestrator_session'
 )
 
 CORS(app, supports_credentials=True)
 
-# Paths
 CONFIG_FILE = '/app/config/config.json'
 SETUP_FLAG = '/config/setup_complete'
 WORKSPACE = os.getenv('SUPOS_WORKSPACE', '/workspace')
@@ -47,45 +48,99 @@ os.makedirs(LOG_DIR, exist_ok=True)
 INSTALL_LOG = os.path.join(LOG_DIR, 'install.log')
 
 client = docker.from_env()
-
 installation_process = None
 installation_data = {}
 
-# ==================== AUTHENTICATION ====================
+# ==================== ROBUST AUTHENTICATION ====================
+
+def refresh_access_token():
+    refresh_token = session.get('refresh_token')
+    if not refresh_token:
+        return False
+
+    try:
+        response = requests.post(
+            'http://172.17.0.1:8081/realms/supos/protocol/openid-connect/token',
+            data={
+                'grant_type': 'refresh_token',
+                'client_id': 'supos',
+                'client_secret': 'VaOS2makbDhJJsLlYPt4Wl87bo9VzXiO',
+                'refresh_token': refresh_token
+            },
+            timeout=10
+        )
+
+        if response.status_code == 200:
+            token_data = response.json()
+            session['access_token'] = token_data.get('access_token')
+            session['refresh_token'] = token_data.get('refresh_token')
+            session['token_expires_at'] = (
+                datetime.utcnow() + timedelta(seconds=token_data.get('expires_in', 300))
+            ).isoformat()
+            session.modified = True
+            return True
+    except:
+        pass
+
+    return False
+
+def validate_token_with_retry(max_retries=2):
+    if 'access_token' not in session:
+        return False
+
+    expires_at = session.get('token_expires_at')
+    if expires_at:
+        expiry = datetime.fromisoformat(expires_at)
+        if datetime.utcnow() + timedelta(minutes=5) > expiry:
+            if not refresh_access_token():
+                return False
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(
+                'http://172.17.0.1:8081/realms/supos/protocol/openid-connect/userinfo',
+                headers={'Authorization': f"Bearer {session['access_token']}"},
+                timeout=5
+            )
+
+            if response.status_code == 200:
+                return True
+
+            if response.status_code == 401 and attempt < max_retries - 1:
+                if refresh_access_token():
+                    continue
+                else:
+                    return False
+
+        except requests.exceptions.RequestException:
+            if attempt < max_retries - 1:
+                time.sleep(0.5)
+                continue
+
+    return False
 
 def require_auth(f):
-    """Protect routes ONLY after setup completes"""
     @wraps(f)
     def decorated(*args, **kwargs):
         if not is_setup_complete():
             return f(*args, **kwargs)
 
-        # FIX: Check session validity
-        if 'keycloak_user' not in session:
-            if request.path.startswith('/api/'):
-                return jsonify({
-                    'error': 'Authentication required',
-                    'redirect': '/login'
-                }), 401
-            return redirect('/login')
+        if validate_token_with_retry():
+            return f(*args, **kwargs)
 
-        # FIX: Validate session timestamp (optional expiry check)
-        session_created = session.get('session_created_at')
-        if session_created:
-            created_time = datetime.fromisoformat(session_created)
-            if datetime.utcnow() - created_time > timedelta(hours=24):
-                session.clear()
-                return jsonify({
-                    'error': 'Session expired',
-                    'redirect': '/login'
-                }), 401
+        if request.path.startswith('/api/'):
+            return jsonify({
+                'error': 'Authentication required',
+                'message': 'Please log in again',
+                'redirect': '/login'
+            }), 401
 
-        return f(*args, **kwargs)
+        return redirect('/login')
+
     return decorated
 
 @app.route('/login')
 def login_page():
-    """Redirect to Keycloak supos realm"""
     if not is_setup_complete():
         return redirect('/')
 
@@ -104,10 +159,8 @@ def login_page():
         f"scope=openid"
     )
 
-
 @app.route('/auth/callback')
 def auth_callback():
-    """OAuth callback - supos realm"""
     code = request.args.get('code')
     if not code:
         return jsonify({'error': 'No authorization code'}), 400
@@ -118,8 +171,6 @@ def auth_callback():
     callback = f"http://{domain}:8080/auth/callback"
 
     try:
-        import requests
-
         token_resp = requests.post(token_url, data={
             'grant_type': 'authorization_code',
             'client_id': 'supos',
@@ -131,24 +182,25 @@ def auth_callback():
         if token_resp.status_code != 200:
             return jsonify({'error': 'Token exchange failed', 'details': token_resp.text}), 400
 
-        access_token = token_resp.json().get('access_token')
+        token_data = token_resp.json()
 
         userinfo_resp = requests.get(
             "http://172.17.0.1:8081/realms/supos/protocol/openid-connect/userinfo",
-            headers={'Authorization': f'Bearer {access_token}'},
+            headers={'Authorization': f"Bearer {token_data['access_token']}"},
             timeout=10
         )
 
         if userinfo_resp.status_code == 200:
             user = userinfo_resp.json()
 
-            # FIX: Set session with explicit permanent flag and timestamp
             session.permanent = True
             session['keycloak_user'] = user.get('preferred_username', 'admin')
-            session['access_token'] = access_token
+            session['access_token'] = token_data.get('access_token')
+            session['refresh_token'] = token_data.get('refresh_token')
+            session['token_expires_at'] = (
+                datetime.utcnow() + timedelta(seconds=token_data.get('expires_in', 300))
+            ).isoformat()
             session['session_created_at'] = datetime.utcnow().isoformat()
-
-            # FIX: Force session save
             session.modified = True
 
             return redirect('/')
@@ -165,31 +217,20 @@ def logout():
 
 @app.route('/api/auth/status')
 def auth_status():
-    """FIX: Enhanced auth status endpoint (unprotected for health checks)"""
-    is_authenticated = 'keycloak_user' in session
-    user = session.get('keycloak_user')
-
-    # Check session age
-    session_age_seconds = None
-    session_created = session.get('session_created_at')
-    if session_created:
-        created_time = datetime.fromisoformat(session_created)
-        session_age_seconds = (datetime.utcnow() - created_time).total_seconds()
+    is_authenticated = validate_token_with_retry()
 
     return jsonify({
         'authenticated': is_authenticated,
-        'user': user,
+        'user': session.get('keycloak_user'),
         'setup_complete': is_setup_complete(),
-        'session_age_seconds': session_age_seconds,
-        'session_expires_in_hours': 24 - (session_age_seconds / 3600) if session_age_seconds else None
+        'token_expires_at': session.get('token_expires_at')
     })
 
 @app.route('/api/apps/list')
 def list_apps():
-    """Return available optional apps based on OS_RESOURCE_SPEC"""
     try:
         env_file = os.path.join(WORKSPACE, '.env')
-        resource_spec = '2'  # Default to 8c16g
+        resource_spec = '2'
 
         if os.path.exists(env_file):
             with open(env_file, 'r') as f:
@@ -198,52 +239,17 @@ def list_apps():
                         resource_spec = line.strip().split('=')[1]
                         break
 
-        # Base apps available in both specs
         base_apps = [
-            {
-                'id': 'grafana',
-                'name': 'Grafana',
-                'description': 'Metrics visualization and monitoring dashboards',
-                'icon': '📊',
-                'category': 'monitoring'
-            },
-            {
-                'id': 'minio',
-                'name': 'MinIO',
-                'description': 'S3-compatible object storage for data and backups',
-                'icon': '🗄️',
-                'category': 'storage'
-            },
-            {
-                'id': 'mcpclient',
-                'name': 'MCP Client',
-                'description': 'Model Context Protocol client for AI integrations',
-                'icon': '🤖',
-                'category': 'ai'
-            }
+            {'id': 'grafana', 'name': 'Grafana', 'description': 'Metrics visualization and monitoring dashboards', 'icon': '📊', 'category': 'monitoring'},
+            {'id': 'minio', 'name': 'MinIO', 'description': 'S3-compatible object storage for data and backups', 'icon': '🗄️', 'category': 'storage'},
+            {'id': 'mcpclient', 'name': 'MCP Client', 'description': 'Model Context Protocol client for AI integrations', 'icon': '🤖', 'category': 'ai'}
         ]
 
-        # Extended apps only for 8c16g (high resource)
         extended_apps = [
-            {
-                'id': 'elk',
-                'name': 'ELK Stack',
-                'description': 'Elasticsearch, Logstash, Kibana for log analytics',
-                'icon': '🔍',
-                'category': 'logging',
-                'requires_high_resource': True
-            },
-            {
-                'id': 'gitea',
-                'name': 'Gitea',
-                'description': 'Self-hosted Git service for version control',
-                'icon': '🔀',
-                'category': 'devops',
-                'requires_high_resource': True
-            }
+            {'id': 'elk', 'name': 'ELK Stack', 'description': 'Elasticsearch, Logstash, Kibana for log analytics', 'icon': '🔍', 'category': 'logging', 'requires_high_resource': True},
+            {'id': 'gitea', 'name': 'Gitea', 'description': 'Self-hosted Git service for version control', 'icon': '🔀', 'category': 'devops', 'requires_high_resource': True}
         ]
 
-        # ALWAYS return all apps - frontend handles grey-out
         apps = base_apps + extended_apps
 
         return jsonify({
@@ -253,23 +259,15 @@ def list_apps():
         })
 
     except Exception as e:
-        return jsonify({
-            'apps': [],
-            'error': str(e)
-        }), 500
+        return jsonify({'apps': [], 'error': str(e)}), 500
 
 # ==================== KEYCLOAK USER MANAGEMENT ====================
 
 def create_keycloak_user(username, password, email, domain, port):
-    """
-    Create user in both supos and master realms.
-    Uses Docker bridge IP to reach keycloak exposed port.
-    """
-    # Docker bridge + exposed port (supos-bedrock runs on default bridge)
+    """Create user in both supos and master realms"""
     keycloak_url = "http://172.17.0.1:8081"
 
     def check_keycloak_health(host, port):
-        """Raw TCP health check (Keycloak removed curl)"""
         import socket
         try:
             with socket.create_connection((host, port), timeout=2):
@@ -278,16 +276,13 @@ def create_keycloak_user(username, password, email, domain, port):
             return False
 
     try:
-        # Wait for Keycloak to be ready
-        max_retries = 30
-        for i in range(max_retries):
+        for i in range(30):
             if check_keycloak_health("172.17.0.1", 8081):
                 break
             time.sleep(2)
         else:
             return {"success": False, "message": "Keycloak not ready after 60 seconds"}
 
-        # Get admin token
         token_resp = requests.post(
             f"{keycloak_url}/realms/master/protocol/openid-connect/token",
             data={
@@ -317,7 +312,6 @@ def create_keycloak_user(username, password, email, domain, port):
             }]
         }
 
-        # === SUPOS REALM ===
         supos_resp = requests.post(
             f"{keycloak_url}/admin/realms/supos/users",
             headers=headers,
@@ -331,7 +325,6 @@ def create_keycloak_user(username, password, email, domain, port):
         if supos_resp.status_code != 201:
             return {"success": False, "message": f"Supos user creation failed: {supos_resp.status_code}"}
 
-        # Get supos user ID
         supos_user_id = supos_resp.headers.get('Location', '').split('/')[-1]
         if not supos_user_id:
             query = requests.get(
@@ -343,7 +336,6 @@ def create_keycloak_user(username, password, email, domain, port):
             if users:
                 supos_user_id = users[0]['id']
 
-        # Get supos client
         client_resp = requests.get(
             f"{keycloak_url}/admin/realms/supos/clients?clientId=supos",
             headers=headers, timeout=10
@@ -354,7 +346,6 @@ def create_keycloak_user(username, password, email, domain, port):
             return {"success": False, "message": "supos client not found"}
         supos_client_uuid = clients[0]['id']
 
-        # Get super-admin role
         roles_resp = requests.get(
             f"{keycloak_url}/admin/realms/supos/clients/{supos_client_uuid}/roles",
             headers=headers, timeout=10
@@ -365,7 +356,6 @@ def create_keycloak_user(username, password, email, domain, port):
         if not super_admin:
             return {"success": False, "message": "super-admin role not found"}
 
-        # Assign super-admin
         assign_resp = requests.post(
             f"{keycloak_url}/admin/realms/supos/users/{supos_user_id}/role-mappings/clients/{supos_client_uuid}",
             headers=headers,
@@ -375,7 +365,6 @@ def create_keycloak_user(username, password, email, domain, port):
         if assign_resp.status_code not in [204, 200]:
             return {"success": False, "message": f"Supos role assignment failed: {assign_resp.status_code}"}
 
-        # === MASTER REALM ===
         master_resp = requests.post(
             f"{keycloak_url}/admin/realms/master/users",
             headers=headers,
@@ -386,7 +375,6 @@ def create_keycloak_user(username, password, email, domain, port):
         if master_resp.status_code not in [201, 409]:
             return {"success": False, "message": f"Master user creation failed: {master_resp.status_code}"}
 
-        # Get master user ID
         master_user_id = None
         if master_resp.status_code == 201:
             master_user_id = master_resp.headers.get('Location', '').split('/')[-1]
@@ -404,7 +392,6 @@ def create_keycloak_user(username, password, email, domain, port):
         if not master_user_id:
             return {"success": False, "message": "Could not get master user ID"}
 
-        # Get master realm roles
         realm_roles_resp = requests.get(
             f"{keycloak_url}/admin/realms/master/roles",
             headers=headers, timeout=10
@@ -418,7 +405,6 @@ def create_keycloak_user(username, password, email, domain, port):
         if not admin_role or not default_roles:
             return {"success": False, "message": "Master roles not found"}
 
-        # Assign master roles
         master_assign = requests.post(
             f"{keycloak_url}/admin/realms/master/users/{master_user_id}/role-mappings/realm",
             headers=headers,
@@ -432,38 +418,9 @@ def create_keycloak_user(username, password, email, domain, port):
         if master_assign.status_code not in [204, 200]:
             return {"success": False, "message": f"Master role assignment failed: {master_assign.status_code}"}
 
-        # === DELETE DEFAULTS ===
-        # Delete supos user (Comment out due to BUG, might cause certain containers fail to restart)
-        # default_supos = requests.get(
-        #     f"{keycloak_url}/admin/realms/supos/users?username=supos&exact=true",
-        #     headers=headers, timeout=10
-        # )
-        # if default_supos.status_code == 200:
-        #     for user in default_supos.json():
-        #         if user['username'] == 'supos':
-        #             requests.delete(
-        #                 f"{keycloak_url}/admin/realms/supos/users/{user['id']}",
-        #                 headers=headers, timeout=10
-        #             )
-        #             break
-
-        # Delete admin user (This still cause BUG where routes leads to 403)
-        # default_admin = requests.get(
-        #     f"{keycloak_url}/admin/realms/master/users?username=admin&exact=true",
-        #     headers=headers, timeout=10
-        # )
-        # if default_admin.status_code == 200:
-        #     for user in default_admin.json():
-        #         if user['username'] == 'admin':
-        #             requests.delete(
-        #                 f"{keycloak_url}/admin/realms/master/users/{user['id']}",
-        #                 headers=headers, timeout=10
-        #             )
-        #             break
-
         return {
             "success": True,
-            "message": f"✓ User {username} created in both realms with proper roles. Default accounts removed."
+            "message": f"✓ User {username} created in both realms with proper roles"
         }
 
     except requests.exceptions.RequestException as e:
@@ -472,10 +429,7 @@ def create_keycloak_user(username, password, email, domain, port):
         return {"success": False, "message": f"Error: {str(e)}"}
 
 def configure_keycloak_orchestrator_client(domain, port=8088):
-    """
-    Register orchestrator's callback URL in Keycloak admin-cli client.
-    Called after installation completes.
-    """
+    """Register orchestrator's callback URL in Keycloak"""
     keycloak_url = "http://172.17.0.1:8081"
     orchestrator_callback = f"http://{domain}:8080/auth/callback"
 
@@ -488,7 +442,6 @@ def configure_keycloak_orchestrator_client(domain, port=8088):
             return False
 
     try:
-        # Wait for Keycloak
         for i in range(30):
             if check_keycloak_health("172.17.0.1", 8081):
                 break
@@ -496,7 +449,6 @@ def configure_keycloak_orchestrator_client(domain, port=8088):
         else:
             return {"success": False, "message": "Keycloak not ready"}
 
-        # Get admin token
         token_resp = requests.post(
             f"{keycloak_url}/realms/master/protocol/openid-connect/token",
             data={
@@ -515,7 +467,6 @@ def configure_keycloak_orchestrator_client(domain, port=8088):
             "Content-Type": "application/json"
         }
 
-        # Get admin-cli client ID
         clients_resp = requests.get(
             f"{keycloak_url}/admin/realms/master/clients?clientId=admin-cli",
             headers=headers,
@@ -529,7 +480,6 @@ def configure_keycloak_orchestrator_client(domain, port=8088):
 
         client_uuid = clients[0]["id"]
 
-        # Get current client config
         client_resp = requests.get(
             f"{keycloak_url}/admin/realms/master/clients/{client_uuid}",
             headers=headers,
@@ -538,19 +488,16 @@ def configure_keycloak_orchestrator_client(domain, port=8088):
         client_resp.raise_for_status()
         client_config = client_resp.json()
 
-        # Update redirect URIs
         redirect_uris = client_config.get("redirectUris", [])
         if orchestrator_callback not in redirect_uris:
             redirect_uris.append(orchestrator_callback)
-            redirect_uris.append(f"http://{domain}:8080/*")  # Wildcard for flexibility
+            redirect_uris.append(f"http://{domain}:8080/*")
 
-        # Update web origins for CORS
         web_origins = client_config.get("webOrigins", [])
         orchestrator_origin = f"http://{domain}:8080"
         if orchestrator_origin not in web_origins:
             web_origins.append(orchestrator_origin)
 
-        # Update client - CRITICAL: Enable standard flow for OAuth
         client_config["redirectUris"] = redirect_uris
         client_config["webOrigins"] = web_origins
         client_config["standardFlowEnabled"] = True
@@ -585,7 +532,6 @@ def configure_supos_client_callback(domain, port=8088):
     supos_callback = f"http://{domain}:{port}/inter-api/supos/auth/token"
 
     try:
-        # Get admin token from master realm
         token_resp = requests.post(
             f"{keycloak_url}/realms/master/protocol/openid-connect/token",
             data={
@@ -606,7 +552,6 @@ def configure_supos_client_callback(domain, port=8088):
             "Content-Type": "application/json"
         }
 
-        # Get supos client from supos realm (NOT master)
         clients_resp = requests.get(
             f"{keycloak_url}/admin/realms/supos/clients?clientId=supos",
             headers=headers,
@@ -622,7 +567,6 @@ def configure_supos_client_callback(domain, port=8088):
 
         client_uuid = clients[0]["id"]
 
-        # Get current config
         config_resp = requests.get(
             f"{keycloak_url}/admin/realms/supos/clients/{client_uuid}",
             headers=headers,
@@ -634,7 +578,6 @@ def configure_supos_client_callback(domain, port=8088):
 
         client_config = config_resp.json()
 
-        # Update redirect URIs
         redirect_uris = client_config.get("redirectUris", [])
         new_uris = [
             orchestrator_callback,
@@ -649,7 +592,6 @@ def configure_supos_client_callback(domain, port=8088):
 
         client_config["redirectUris"] = redirect_uris
 
-        # Apply update to supos client in supos realm
         update_resp = requests.put(
             f"{keycloak_url}/admin/realms/supos/clients/{client_uuid}",
             headers=headers,
@@ -705,7 +647,6 @@ def write_setup_flag(config):
 
 @app.route('/')
 def index():
-    """Serve React app - auth handled by @require_auth in React"""
     return send_from_directory('static', 'index.html')
 
 @app.route('/<path:path>')
@@ -803,7 +744,6 @@ def check_volume():
 
 @app.route('/api/config/update', methods=['POST'])
 def update_config():
-    """Save initial config from setup wizard"""
     try:
         data = request.get_json()
         env_file = os.path.join(WORKSPACE, '.env')
@@ -852,70 +792,25 @@ def update_config():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-# =============== ORCHESTRATOR ROUTES ========================
+# ==================== INSTALLATION =======================
 
-@app.route('/api/supos/container/<container_id>/<action>', methods=['POST'])
-@require_auth
-def container_action(container_id, action):
-    """Start/stop/restart container"""
-    if action not in ['start', 'stop', 'restart']:
-        return jsonify({"error": "Invalid action"}), 400
-
-    try:
-        container = client.containers.get(container_id)
-        getattr(container, action)()
-        return jsonify({"success": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/supos/backup', methods=['POST'])
-@require_auth
-def create_backup():
-    """Backup volumes and config"""
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    backup_dir = f"/workspace/backups/backup_{timestamp}"
-    os.makedirs(backup_dir, exist_ok=True)
-
-    subprocess.run(['cp', '-r', '/workspace/mount', backup_dir], check=True)
-    volumes_path = os.getenv('VOLUMES_PATH', '/volumes/supos/data')
-    subprocess.run(['tar', '-czf', f"{backup_dir}/volumes.tar.gz", volumes_path])
-
-    return jsonify({"success": True, "backup_path": backup_dir})
-
-
-
-def get_host_ip():
-    try:
-        result = subprocess.run(['ip', 'route', 'show', 'default'], capture_output=True, text=True)
-        return result.stdout.split()[2]
-    except:
-        return "172.17.0.1"
-
-# ===================== INSTALLATION =======================
 def sanitize_log_line(line):
-    """Remove sensitive data from log lines"""
-    # Remove passwords from environment variable assignments
     line = re.sub(r'(PASSWORD|TOKEN|SECRET|KEY)=\S+', r'\1=***REDACTED***', line, flags=re.IGNORECASE)
-    # Remove passwords from command-line arguments
     line = re.sub(r'--password[\s=]\S+', r'--password=***REDACTED***', line, flags=re.IGNORECASE)
     line = re.sub(r'-p[\s=]\S+', r'-p=***REDACTED***', line)
-    # Remove admin credentials from log headers
     line = re.sub(r'(Admin|Username|User):\s*\S+', r'\1: ***REDACTED***', line, flags=re.IGNORECASE)
 
-    # Remove default credential display blocks
     if 'Default user name:' in line:
-        return ''  # Skip this line entirely
+        return ''
     if line.strip().startswith('password:') and line.strip() != 'password: ***REDACTED***':
-        return ''  # Skip standalone password display
+        return ''
 
-    # Simplify keycloak user creation message
     if 'User' in line and 'created in both realms' in line:
         return '✓ Custom admin user created successfully\n'
 
     return line
 
 def run_installation_async(admin_data, network_data, selected_apps):
-    """Run installation in background thread"""
     global installation_data
 
     try:
@@ -993,13 +888,6 @@ def run_installation_async(admin_data, network_data, selected_apps):
             )
             log_file.write(supos_result['message'] + "\n")
 
-            # log_file.write("\nConfiguring orchestrator OAuth callback...\n")
-            # oauth_result = configure_keycloak_orchestrator_client(
-            #     domain=network_data.get('domain'),
-            #     port=network_data.get('port', 8088)
-            # )
-            # log_file.write(oauth_result['message'] + "\n")
-
             if not keycloak_result['success']:
                 log_file.write("\n⚠ Keycloak user creation failed\n")
 
@@ -1024,7 +912,6 @@ def run_installation_async(admin_data, network_data, selected_apps):
 
 @app.route('/api/install/start', methods=['POST'])
 def start_install():
-    """Start installation in background and return immediately"""
     global installation_process, installation_data
 
     try:
@@ -1033,13 +920,11 @@ def start_install():
         network_data = data.get('network', {})
         selected_apps = data.get('selected_apps', [])
 
-        # Reset installation state
         installation_data = {
             'status': 'starting',
             'started_at': datetime.now().isoformat()
         }
 
-        # Start installation in background thread
         thread = threading.Thread(
             target=run_installation_async,
             args=(admin_data, network_data, selected_apps),
@@ -1064,7 +949,6 @@ def start_install():
 
 @app.route('/api/install/logs/stream')
 def stream_logs():
-    """Stream logs incrementally with sanitization"""
     global installation_data
 
     from_line = request.args.get('from', 0, type=int)
@@ -1081,13 +965,9 @@ def stream_logs():
         with open(INSTALL_LOG, 'r') as f:
             all_lines = f.readlines()
 
-        # Get new lines since last poll
         new_lines = all_lines[from_line:]
-
-        # Sanitize each line
         sanitized = [sanitize_log_line(line.rstrip()) for line in new_lines]
 
-        # Determine status
         status = installation_data.get('status', 'unknown')
         completed = status == 'completed'
         failed = status == 'failed'
@@ -1111,7 +991,6 @@ def stream_logs():
 
 @app.route('/api/install/status')
 def install_status():
-    """Check if installation is running"""
     if os.path.exists(INSTALL_LOG):
         age = time.time() - os.path.getmtime(INSTALL_LOG)
         if age < 600:
@@ -1146,12 +1025,8 @@ def tail_logs():
 @app.route('/api/supos/status')
 @require_auth
 def supos_status():
-    """Get status of supOS containers"""
     try:
-        import docker
-        client = docker.from_env()
         containers = []
-
         for container in client.containers.list(all=True):
             if container.name not in ['supos-bedrock']:
                 containers.append({
@@ -1171,7 +1046,6 @@ def supos_status():
 @app.route('/api/supos/restart', methods=['POST'])
 @require_auth
 def restart_supos():
-    """Restart all supOS containers"""
     try:
         subprocess.run(
             ['docker', 'compose', 'restart'],
@@ -1182,6 +1056,242 @@ def restart_supos():
         return jsonify({"success": True, "message": "Services restarted"})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/supos/container/<container_id>/<action>', methods=['POST'])
+@require_auth
+def container_action(container_id, action):
+    if action not in ['start', 'stop', 'restart']:
+        return jsonify({"error": "Invalid action"}), 400
+
+    try:
+        container = client.containers.get(container_id)
+        getattr(container, action)()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/supos/backup', methods=['POST'])
+@require_auth
+def create_backup():
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup_dir = f"/workspace/backups/backup_{timestamp}"
+    os.makedirs(backup_dir, exist_ok=True)
+
+    subprocess.run(['cp', '-r', '/workspace/mount', backup_dir], check=True)
+    volumes_path = os.getenv('VOLUMES_PATH', '/volumes/supos/data')
+    subprocess.run(['tar', '-czf', f"{backup_dir}/volumes.tar.gz", volumes_path])
+
+    return jsonify({"success": True, "backup_path": backup_dir})
+
+def get_host_ip():
+    try:
+        result = subprocess.run(['ip', 'route', 'show', 'default'], capture_output=True, text=True)
+        return result.stdout.split()[2]
+    except:
+        return "172.17.0.1"
+
+# ==================== VERSION MANAGEMENT ====================
+
+def fetch_recommended_versions():
+    github_url = 'https://raw.githubusercontent.com/leekaize/supOS-bedrock/main/builds.yaml'
+    response = requests.get(github_url, timeout=10)
+
+    if response.status_code != 200:
+        raise Exception(f'GitHub fetch failed: {response.status_code}')
+
+    manifest = yaml.safe_load(response.text)
+
+    recommended = {}
+    for img in manifest.get('images', []):
+        image_name = f"{img['imagePath']}/{img['imageName']}"
+        recommended[image_name] = str(img['imageTag'])
+
+    for img in manifest.get('openImages', []):
+        image_name = img['imageName']
+        recommended[image_name] = str(img['imageTar'])
+
+    return recommended
+
+@app.route('/api/versions/manifest')
+def get_versions_manifest():
+    try:
+        recommended = fetch_recommended_versions()
+        return jsonify({
+            'recommended': recommended,
+            'source': 'https://raw.githubusercontent.com/leekaize/supOS-bedrock/main/builds.yaml'
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/versions/compare')
+def compare_versions():
+    try:
+        recommended = fetch_recommended_versions()
+        containers = []
+
+        for container in client.containers.list(all=True):
+            if container.name == 'supos-bedrock':
+                continue
+
+            image_tags = container.image.tags
+            if not image_tags:
+                continue
+
+            current_image = image_tags[0]
+            image_name, current_tag = parse_image_tag(current_image)
+
+            recommended_tag = None
+            container_base_name = container.name.lower()
+
+            for rec_name, rec_tag in recommended.items():
+                rec_image_name = rec_name.split('/')[-1].lower()
+                image_short_name = image_name.split('/')[-1].lower()
+
+                if container_base_name == rec_image_name or image_short_name == rec_image_name:
+                    recommended_tag = rec_tag
+                    break
+
+            update_available = False
+            if recommended_tag and current_tag != recommended_tag:
+                update_available = compare_version_tags(current_tag, recommended_tag)
+
+            containers.append({
+                'id': container.id[:12],
+                'name': container.name,
+                'status': container.status,
+                'current_version': current_tag,
+                'recommended_version': recommended_tag,
+                'update_available': update_available,
+                'image': current_image
+            })
+
+        return jsonify({
+            'containers': containers,
+            'timestamp': datetime.utcnow().isoformat()
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/container/<container_name>/update', methods=['POST'])
+@require_auth
+def update_container(container_name):
+    try:
+        container = client.containers.get(container_name)
+        current_image = container.image.tags[0] if container.image.tags else None
+
+        if not current_image:
+            return jsonify({'error': 'Cannot determine current image'}), 400
+
+        image_name, current_tag = parse_image_tag(current_image)
+        recommended = fetch_recommended_versions()
+
+        recommended_tag = None
+        for rec_name, rec_tag in recommended.items():
+            rec_image_name = rec_name.split('/')[-1].lower()
+            image_short_name = image_name.split('/')[-1].lower()
+
+            if image_short_name == rec_image_name:
+                recommended_tag = rec_tag
+                break
+
+        if not recommended_tag:
+            return jsonify({'error': 'No recommended version found'}), 404
+
+        new_image = f"{image_name}:{recommended_tag}"
+
+        # Determine compose file
+        env_file = os.path.join(WORKSPACE, '.env')
+        resource_spec = '2'
+        if os.path.exists(env_file):
+            with open(env_file, 'r') as f:
+                for line in f:
+                    if line.startswith('OS_RESOURCE_SPEC='):
+                        resource_spec = line.strip().split('=')[1]
+                        break
+
+        compose_file = f"{WORKSPACE}/docker-compose-8c16g.yml" if resource_spec == '2' else f"{WORKSPACE}/docker-compose-4c8g.yml"
+
+        # PATH 3: Create temporary override file
+        override_file = f"{WORKSPACE}/docker-compose.update-{container_name}.yml"
+        override_content = f"""services:
+  {container_name}:
+    image: {new_image}
+"""
+
+        with open(override_file, 'w') as f:
+            f.write(override_content)
+
+        try:
+            # Apply override with full compose context
+            result = subprocess.run(
+                [
+                    'docker', 'compose',
+                    '--project-name', 'supos',
+                    '--env-file', env_file,
+                    '-f', compose_file,
+                    '-f', override_file,
+                    'up', '-d', container_name
+                ],
+                cwd=WORKSPACE,
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode != 0:
+                return jsonify({
+                    'error': f'Update failed: {result.stderr}',
+                    'stdout': result.stdout
+                }), 500
+
+            return jsonify({
+                'success': True,
+                'container': container_name,
+                'old_version': current_tag,
+                'new_version': recommended_tag,
+                'message': f'Updated {container_name} from {current_tag} to {recommended_tag}'
+            })
+
+        finally:
+            if os.path.exists(override_file):
+                os.remove(override_file)
+
+    except docker.errors.NotFound:
+        return jsonify({'error': f'Container {container_name} not found'}), 404
+    except Exception as e:
+        import traceback
+        return jsonify({
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }), 500
+
+def parse_image_tag(image_string):
+    if ':' in image_string:
+        image_name, tag = image_string.rsplit(':', 1)
+    else:
+        image_name = image_string
+        tag = 'latest'
+
+    return image_name, tag
+
+def compare_version_tags(current, recommended):
+    if current == recommended:
+        return False
+
+    try:
+        def normalize(ver):
+            ver = re.sub(r'^[vV]', '', ver)
+            ver = re.sub(r'(-[A-Z]\d+)$', '', ver)
+            parts = ver.split('.')
+            while len(parts) < 3:
+                parts.append('0')
+            return '.'.join(parts[:3])
+
+        current_norm = normalize(current)
+        recommended_norm = normalize(recommended)
+
+        return pkg_version.parse(recommended_norm) > pkg_version.parse(current_norm)
+    except:
+        return current != recommended
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=False)

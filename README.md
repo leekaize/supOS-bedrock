@@ -3,9 +3,13 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Status](https://img.shields.io/badge/status-development-yellow.svg)]()
 
+> [!warning]
+> Not ready for production-use, only for development.
+
 > [!important]
-> **This is a drop-in reimagining of [supOS-CE](https://github.com/FREEZONEX/supOS-CE).**
-> Think Nextcloud AIO for industrial systems—install the core, choose your apps.
+> This is a drop-in reimagining of [supOS-CE](https://github.com/FREEZONEX/supOS-CE).
+
+Think [Nextcloud AIO](https://github.com/nextcloud/all-in-one) for industrial systems—install the core, choose your apps.
 
 ## Quick Start
 ```bash
@@ -26,7 +30,7 @@ Then access through web browser: http://YOUR_SERVER_IP:8080
 - 4GB RAM minimum
 - Ports 8080 and 8088 available
 
-### v0.1 Roadmap
+### v0.1 Roadmap (Hackathon Submission)
 
 - [x] Single Docker command to run on both amd64 & arm64
 - [x] GUI for first-run setup and installation
@@ -36,12 +40,17 @@ Then access through web browser: http://YOUR_SERVER_IP:8080
   - [x] Installation Logs: Show stages of installation with detailed logs.
 - [ ] GUI for orchestrator interface
   - [x] Redirect to Keycloak for access
-  - [ ] Container version update recommendations
+  - [x] Container version update recommendations
   - [ ] Backup/restore functionality
+
+### v0.2 Roadmap (Ready for Production Use)
+
+- [ ] Fix Bugs in GitHub Issue
+  - [ ] Implement proper disable/block for default admin, necessary for security.
 
 ## What it does
 
-- **Setup wizard** → Zero manual config. Admin created via UI.
+- **Setup wizard** → Zero terminal config, admin created via UI
 - **Modular apps** → Install Grafana, MinIO, ELK post-deployment
 - **Integrated app store** → Add capabilities without reinstall
 - **One-click updates** → Version management from UI

@@ -1,12 +1,14 @@
 import { useState, useEffect } from 'react';
-import { Table, Button, Space, Tag, message, Modal, Typography, Card } from 'antd';
+import { Table, Button, Space, Tag, message, Modal, Typography, Card, Badge, Tooltip } from 'antd';
 import {
     PlayCircleOutlined,
     PauseCircleOutlined,
     ReloadOutlined,
     SaveOutlined,
-    DashboardOutlined
+    DashboardOutlined,
+    CloudUploadOutlined
 } from '@ant-design/icons';
+import { authAPI } from '../utils/authFetch';
 import { API_BASE } from '../config';
 
 const { Title, Text } = Typography;
@@ -15,16 +17,14 @@ function ContainerManager() {
     const [containers, setContainers] = useState([]);
     const [loading, setLoading] = useState(true);
     const [actionLoading, setActionLoading] = useState({});
+    const [updateModal, setUpdateModal] = useState({ visible: false, container: null });
 
     const fetchContainers = async () => {
         try {
-            const res = await fetch(`${API_BASE}/supos/status`, {
-                credentials: 'include'
-            });
-            const data = await res.json();
+            const data = await authAPI.get('/versions/compare');
             setContainers(data.containers || []);
         } catch (err) {
-            message.error('Failed to fetch containers');
+            console.error('Fetch error:', err);
         } finally {
             setLoading(false);
         }
@@ -32,32 +32,83 @@ function ContainerManager() {
 
     useEffect(() => {
         fetchContainers();
-        const interval = setInterval(fetchContainers, 15000);
+        const interval = setInterval(fetchContainers, 30000);
         return () => clearInterval(interval);
     }, []);
 
     const handleAction = async (containerId, action) => {
-        console.log(`Action: ${action} on ${containerId}`); // DEBUG
         setActionLoading({ [containerId]: action });
 
         try {
-            const res = await fetch(`${API_BASE}/supos/container/${containerId}/${action}`, {
-                method: 'POST',
-                credentials: 'include'
-            });
+            await authAPI.post(`/supos/container/${containerId}/${action}`);
+            message.success(`Container ${action}ed`);
+            fetchContainers();
+        } catch (err) {
+            console.error('Action error:', err);
+        } finally {
+            setActionLoading({});
+        }
+    };
 
-            console.log('Response:', res.status, await res.text()); // DEBUG
+    const handleUpdate = (containerName, currentVersion, recommendedVersion) => {
+        setUpdateModal({
+            visible: true,
+            container: { containerName, currentVersion, recommendedVersion }
+        });
+    };
 
-            if (res.ok) {
-                message.success(`Container ${action}ed`);
-                fetchContainers();
+    const executeUpdate = async () => {
+        const { containerName, currentVersion, recommendedVersion } = updateModal.container;
+        setUpdateModal({ visible: false, container: null });
+
+        // Mark container as updating - keep it in list
+        setContainers(prev => prev.map(c =>
+            c.name === containerName
+                ? { ...c, status: 'updating', _isUpdating: true }
+                : c
+        ));
+
+        setActionLoading({ [containerName]: 'updating' });
+
+        try {
+            const data = await authAPI.post(`/container/${containerName}/update`);
+
+            if (data.success) {
+                message.success(data.message);
+
+                // Poll for container to come back
+                let attempts = 0;
+                const pollInterval = setInterval(async () => {
+                    attempts++;
+
+                    try {
+                        const freshData = await authAPI.get('/versions/compare');
+                        const updatedContainer = freshData.containers.find(c => c.name === containerName);
+
+                        if (updatedContainer && updatedContainer.status === 'running') {
+                            clearInterval(pollInterval);
+                            setContainers(freshData.containers);
+                            setActionLoading({});
+                            message.success(`${containerName} is now running ${updatedContainer.current_version}`);
+                        } else if (attempts > 30) {
+                            // Give up after 60 seconds
+                            clearInterval(pollInterval);
+                            setActionLoading({});
+                            fetchContainers();
+                            message.warning('Update completed but container status unclear. Refresh to verify.');
+                        }
+                    } catch (err) {
+                        console.error('Poll error:', err);
+                    }
+                }, 2000);
             } else {
-                message.error('Action failed');
+                message.error(data.error || 'Update failed');
+                fetchContainers();
+                setActionLoading({});
             }
         } catch (err) {
-            console.error('Action error:', err); // DEBUG
-            message.error('Network error');
-        } finally {
+            console.error('Update error:', err);
+            fetchContainers();
             setActionLoading({});
         }
     };
@@ -68,16 +119,12 @@ function ContainerManager() {
             content: 'Backup all volumes and configuration?',
             onOk: async () => {
                 try {
-                    const res = await fetch(`${API_BASE}/supos/backup`, {
-                        method: 'POST',
-                        credentials: 'include'
-                    });
-                    const data = await res.json();
+                    const data = await authAPI.post('/supos/backup');
                     if (data.success) {
                         message.success(`Backup created: ${data.backup_path}`);
                     }
-                } catch {
-                    message.error('Backup failed');
+                } catch (err) {
+                    console.error('Backup error:', err);
                 }
             }
         });
@@ -99,100 +146,188 @@ function ContainerManager() {
             title: 'Container',
             dataIndex: 'name',
             key: 'name',
-            render: (name) => <Text strong>{name}</Text>
+            render: (name, record) => (
+                <Space direction="vertical" size={0}>
+                    <Text strong>{name}</Text>
+                    <Text type="secondary" style={{ fontSize: 12 }}>{record.image}</Text>
+                </Space>
+            )
         },
         {
             title: 'Status',
             dataIndex: 'status',
             key: 'status',
             render: (status) => (
-                <Tag color={status === 'running' ? 'success' : 'default'}>
+                <Tag color={status === 'running' ? 'green' : status === 'exited' ? 'red' : 'orange'}>
                     {status.toUpperCase()}
                 </Tag>
             )
+        },
+        {
+            title: 'Version',
+            key: 'version',
+            render: (_, record) => (
+                <Space direction="vertical" size={0}>
+                    <Space>
+                        <Text>Current:</Text>
+                        <Tag color="blue">{record.current_version}</Tag>
+                    </Space>
+                    {record.recommended_version && (
+                        <Space>
+                            <Text>Latest:</Text>
+                            <Tag color={record.update_available ? 'orange' : 'green'}>
+                                {record.recommended_version}
+                            </Tag>
+                        </Space>
+                    )}
+                </Space>
+            )
+        },
+        {
+            title: 'Update Status',
+            key: 'update_status',
+            render: (_, record) => {
+                if (!record.recommended_version) {
+                    return <Tag>No manifest data</Tag>;
+                }
+                if (record.update_available) {
+                    return (
+                        <Tooltip title="New version available">
+                            <Badge status="warning" text="Update Available" />
+                        </Tooltip>
+                    );
+                }
+                return (
+                    <Tooltip title="Running latest version">
+                        <Badge status="success" text="Up to Date" />
+                    </Tooltip>
+                );
+            }
         },
         {
             title: 'Actions',
             key: 'actions',
             render: (_, record) => (
                 <Space>
-                    {record.status !== 'running' && (
+                    {record.status === 'running' ? (
+                        <Button
+                            size="small"
+                            icon={<PauseCircleOutlined />}
+                            onClick={() => handleAction(record.id, 'stop')}
+                            loading={actionLoading[record.id] === 'stop'}
+                        >
+                            Stop
+                        </Button>
+                    ) : (
                         <Button
                             size="small"
                             icon={<PlayCircleOutlined />}
-                            loading={actionLoading[record.id] === 'start'}
                             onClick={() => handleAction(record.id, 'start')}
+                            loading={actionLoading[record.id] === 'start'}
                         >
                             Start
-                        </Button>
-                    )}
-                    {record.status === 'running' && (
-                        <Button
-                            size="small"
-                            danger
-                            icon={<PauseCircleOutlined />}
-                            loading={actionLoading[record.id] === 'stop'}
-                            onClick={() => handleAction(record.id, 'stop')}
-                        >
-                            Stop
                         </Button>
                     )}
                     <Button
                         size="small"
                         icon={<ReloadOutlined />}
-                        loading={actionLoading[record.id] === 'restart'}
                         onClick={() => handleAction(record.id, 'restart')}
+                        loading={actionLoading[record.id] === 'restart'}
                     >
                         Restart
                     </Button>
+                    {record.update_available && (
+                        <Button
+                            size="small"
+                            type="primary"
+                            icon={<CloudUploadOutlined />}
+                            onClick={() => handleUpdate(
+                                record.name,
+                                record.current_version,
+                                record.recommended_version
+                            )}
+                            loading={actionLoading[record.name] === 'updating'}
+                        >
+                            Update
+                        </Button>
+                    )}
                 </Space>
             )
         }
     ];
 
-    const runningCount = containers.filter(c => c.status === 'running').length;
+    const updatesAvailable = containers.filter(c => c.update_available).length;
 
     return (
-        <div>
-            <Title level={3}>Container Management</Title>
-
-            <Space style={{ margin: '20px 0' }}>
-                <Button
-                    type="primary"
-                    icon={<ReloadOutlined />}
-                    onClick={fetchContainers}
-                    loading={loading}
-                >
-                    Refresh
-                </Button>
-                <Button
-                    icon={<DashboardOutlined />}
-                    onClick={openSuposDashboard}
-                >
-                    Open supOS Dashboard
-                </Button>
-                <Button
-                    icon={<SaveOutlined />}
-                    onClick={handleBackup}
-                >
-                    Create Backup
-                </Button>
-            </Space>
-
-            <Text type="secondary">
-                {"\n"}
-                {runningCount} of {containers.length} containers running
-            </Text>
-
+        <div style={{ padding: 24 }}>
             <Card>
-                <Table
-                    columns={columns}
-                    dataSource={containers}
-                    rowKey="id"
-                    loading={loading}
-                    pagination={false}
-                />
+                <Space direction="vertical" style={{ width: '100%' }} size="large">
+                    <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                        <div>
+                            <Title level={3}>Container Management</Title>
+                            {updatesAvailable > 0 && (
+                                <Badge
+                                    count={updatesAvailable}
+                                    style={{ backgroundColor: '#faad14' }}
+                                >
+                                    <Text type="secondary">Updates Available</Text>
+                                </Badge>
+                            )}
+                        </div>
+                        <Space>
+                            <Button
+                                icon={<ReloadOutlined />}
+                                onClick={fetchContainers}
+                                loading={loading}
+                            >
+                                Refresh
+                            </Button>
+                            <Button
+                                icon={<SaveOutlined />}
+                                onClick={handleBackup}
+                            >
+                                Backup
+                            </Button>
+                            <Button
+                                type="primary"
+                                icon={<DashboardOutlined />}
+                                onClick={openSuposDashboard}
+                            >
+                                Open Dashboard
+                            </Button>
+                        </Space>
+                    </Space>
+
+                    <Table
+                        columns={columns}
+                        dataSource={containers}
+                        rowKey="id"
+                        loading={loading}
+                        pagination={false}
+                    />
+                </Space>
             </Card>
+
+            <Modal
+                title="Update Container"
+                open={updateModal.visible}
+                onOk={executeUpdate}
+                onCancel={() => setUpdateModal({ visible: false, container: null })}
+                okText="Update"
+                cancelText="Cancel"
+                okButtonProps={{ danger: true }}
+            >
+                {updateModal.container && (
+                    <div>
+                        <p>Update <strong>{updateModal.container.containerName}</strong>?</p>
+                        <p>Current: <Tag color="blue">{updateModal.container.currentVersion}</Tag></p>
+                        <p>New: <Tag color="green">{updateModal.container.recommendedVersion}</Tag></p>
+                        <p style={{ marginTop: 16, color: '#ff4d4f' }}>
+                            ⚠️ Container will be stopped and recreated. This may take 1-2 minutes.
+                        </p>
+                    </div>
+                )}
+            </Modal>
         </div>
     );
 }
