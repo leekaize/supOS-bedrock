@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { ConfigProvider, theme as antTheme, Steps, Button, Card, Result, Spin } from 'antd';
+import { ConfigProvider, theme as antTheme, Steps, Button, Card, Result, Spin, Typography } from 'antd';
 import { CheckCircleOutlined, DashboardOutlined } from '@ant-design/icons';
 import SystemValidation from './components/SystemValidation';
 import AdminForm from './components/AdminForm';
@@ -8,6 +8,8 @@ import Installation from './components/Installation';
 import ContainerManager from './components/ContainerManager';
 import './App.css';
 import { API_BASE } from './config';
+
+const { Title } = Typography;
 
 function App() {
   const [current, setCurrent] = useState(0);
@@ -31,40 +33,54 @@ function App() {
     return () => mediaQuery.removeEventListener('change', handler);
   }, []);
 
-  // FIX: Wait for auth session before testing protected endpoints
   useEffect(() => {
     const verifyState = async () => {
       try {
         const setupRes = await fetch(`${API_BASE}/setup/status`);
+
+        if (!setupRes.ok) {
+          throw new Error(`Status check failed: ${setupRes.status}`);
+        }
+
         const setupData = await setupRes.json();
 
-        if (setupData.setup_complete) {
-          setSetupComplete(true);
-          const { domain, port } = setupData.config.network;
-          setDashboardUrl(`http://${domain}:${port}/home`);
+        if (!setupData.setup_complete) {
+          setSetupComplete(false);
+          setIsAuthenticated(false);
+          setAuthChecked(true);
+          return;
+        }
 
-          // FIX: Check auth status endpoint first (unprotected)
-          const authRes = await fetch(`${API_BASE}/auth/status`, {
+        setSetupComplete(true);
+        const { domain, port } = setupData.config.network;
+        setDashboardUrl(`http://${domain}:${port}/home`);
+
+        // Poll for session establishment (handles cookie timing)
+        let authenticated = false;
+        for (let attempt = 0; attempt < 5; attempt++) {
+          const sessionCheck = await fetch(`${API_BASE}/auth/session-check`, {
             credentials: 'include'
           });
 
-          if (authRes.ok) {
-            const authData = await authRes.json();
+          if (sessionCheck.ok) {
+            const sessionData = await sessionCheck.json();
 
-            if (authData.authenticated) {
-              // Session confirmed, now test protected endpoint with retry
-              const authenticated = await testProtectedEndpointWithRetry();
-              setIsAuthenticated(authenticated);
-            } else {
-              // Not authenticated, redirect to login
-              setIsAuthenticated(false);
+            if (sessionData.session_established) {
+              authenticated = await testProtectedEndpointWithRetry();
+              if (authenticated) break; // Success
             }
-          } else {
-            setIsAuthenticated(false);
           }
+
+          // Wait before retry
+          if (attempt < 4) await new Promise(r => setTimeout(r, 800));
         }
+
+        setIsAuthenticated(authenticated);
+
       } catch (err) {
         console.error('State verification failed:', err);
+        setSetupComplete(false);
+        setIsAuthenticated(false);
       } finally {
         setAuthChecked(true);
       }
@@ -73,7 +89,6 @@ function App() {
     verifyState();
   }, []);
 
-  // FIX: Retry logic for 401 errors (handles session cookie timing)
   const testProtectedEndpointWithRetry = async (maxRetries = 3) => {
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
@@ -82,16 +97,15 @@ function App() {
         });
 
         if (testRes.ok) {
-          return true; // Success
+          return true;
         }
 
         if (testRes.status === 401 && attempt < maxRetries - 1) {
-          // Wait before retry (exponential backoff)
           await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
           continue;
         }
 
-        return false; // Failed after retries
+        return false;
       } catch (err) {
         console.error(`Attempt ${attempt + 1} failed:`, err);
         if (attempt < maxRetries - 1) {
@@ -156,6 +170,18 @@ function App() {
     );
   }
 
+  // Setup complete + authenticated = show Container Manager
+  if (setupComplete && isAuthenticated) {
+    return (
+      <ConfigProvider theme={{ algorithm: isDark ? antTheme.darkAlgorithm : antTheme.defaultAlgorithm }}>
+        <div className="App">
+          <ContainerManager dashboardUrl={dashboardUrl} />
+        </div>
+      </ConfigProvider>
+    );
+  }
+
+  // Setup complete + NOT authenticated = require login
   if (setupComplete && !isAuthenticated) {
     return (
       <ConfigProvider theme={{ algorithm: isDark ? antTheme.darkAlgorithm : antTheme.defaultAlgorithm }}>
@@ -175,21 +201,27 @@ function App() {
     );
   }
 
+  // Post-installation success
   if (showInstallSuccess) {
     return (
       <ConfigProvider theme={{ algorithm: isDark ? antTheme.darkAlgorithm : antTheme.defaultAlgorithm }}>
         <div className="App">
           <Result
             status="success"
-            title="supOS-bedrock Installed!"
-            subTitle="Your platform is ready. Manage containers below or access the dashboard."
+            title="Installation Complete!"
+            subTitle="supOS Bedrock is ready"
             extra={[
-              <Button type="primary" icon={<DashboardOutlined />} href={dashboardUrl} target="_blank" key="dashboard">
+              <Button
+                type="primary"
+                key="dashboard"
+                icon={<DashboardOutlined />}
+                onClick={() => window.open(dashboardUrl, '_blank')}
+              >
                 Open supOS Dashboard
               </Button>,
-              <Button key="manage" onClick={() => setShowInstallSuccess(false)}>
-                Manage Containers
-              </Button>,
+              <Button key="orchestrator" onClick={() => window.location.href = '/login'}>
+                Go to Orchestrator
+              </Button>
             ]}
           />
         </div>
@@ -197,20 +229,12 @@ function App() {
     );
   }
 
-  if (setupComplete) {
-    return (
-      <ConfigProvider theme={{ algorithm: isDark ? antTheme.darkAlgorithm : antTheme.defaultAlgorithm }}>
-        <div className="App">
-          <ContainerManager dashboardUrl={dashboardUrl} />
-        </div>
-      </ConfigProvider>
-    );
-  }
-
+  // Default: Setup wizard
   return (
     <ConfigProvider theme={{ algorithm: isDark ? antTheme.darkAlgorithm : antTheme.defaultAlgorithm }}>
       <div className="App">
         <Card style={{ maxWidth: 1000, margin: '40px auto', padding: '20px' }}>
+          <Title level={2}>supOS Bedrock Setup</Title>
           <Steps current={current} items={steps} style={{ marginBottom: 40 }} />
 
           {current === 0 && <SystemValidation onComplete={handleValidationComplete} />}
@@ -227,6 +251,7 @@ function App() {
               adminData={adminData}
               selectedApps={selectedApps}
               onComplete={handleInstallationComplete}
+              onBack={() => setCurrent(2)}
             />
           )}
         </Card>

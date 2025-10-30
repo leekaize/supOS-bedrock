@@ -1,4 +1,4 @@
-"""Keycloak authentication and session management - EXACT original implementation"""
+"""Keycloak authentication and session management"""
 
 import time
 import socket
@@ -10,7 +10,11 @@ from flask import session, redirect, jsonify, request
 from config import is_setup_complete
 
 def validate_token_with_retry(max_retries=3):
-    """Validate Keycloak access token with retry logic"""
+    """Validate Keycloak access token with session awareness"""
+    # Check session marker first
+    if not session.get('auth_verified'):
+        return False
+
     if 'access_token' not in session:
         return False
 
@@ -23,17 +27,22 @@ def validate_token_with_retry(max_retries=3):
             )
 
             if response.status_code == 200:
+                # Refresh validation timestamp
+                session['last_validated'] = datetime.utcnow().isoformat()
+                session.modified = True
                 return True
 
+            # Only retry on 401
             if response.status_code == 401 and attempt < max_retries - 1:
                 if refresh_access_token():
                     continue
-                else:
-                    return False
+                return False
+
+            return False
 
         except requests.exceptions.RequestException:
             if attempt < max_retries - 1:
-                time.sleep(0.5)
+                time.sleep(0.5 * (2 ** attempt))  # Exponential backoff
                 continue
 
     return False
@@ -92,7 +101,7 @@ def require_auth(f):
     return decorated
 
 def create_keycloak_user(username, password, email, domain, port):
-    """Create user in both supos and master realms with proper roles - EXACT original"""
+    """Create user in both supos and master realms with proper roles"""
     keycloak_url = "http://172.17.0.1:8081"
 
     def check_keycloak_health(host, port):
@@ -103,7 +112,7 @@ def create_keycloak_user(username, password, email, domain, port):
             return False
 
     try:
-        # Wait for Keycloak to be ready
+        # Wait for Keycloak
         for i in range(30):
             if check_keycloak_health("172.17.0.1", 8081):
                 break
@@ -134,7 +143,6 @@ def create_keycloak_user(username, password, email, domain, port):
             "username": username,
             "email": email,
             "enabled": True,
-            "emailVerified": True,
             "credentials": [{
                 "type": "password",
                 "value": password,
@@ -142,7 +150,7 @@ def create_keycloak_user(username, password, email, domain, port):
             }]
         }
 
-        # Create user in supos realm
+        # === SUPOS REALM ===
         supos_resp = requests.post(
             f"{keycloak_url}/admin/realms/supos/users",
             headers=headers,
@@ -179,7 +187,7 @@ def create_keycloak_user(username, password, email, domain, port):
             return {"success": False, "message": "supos client not found"}
         supos_client_uuid = clients[0]['id']
 
-        # Get super-admin role
+        # Get super-admin role from supos client
         roles_resp = requests.get(
             f"{keycloak_url}/admin/realms/supos/clients/{supos_client_uuid}/roles",
             headers=headers, timeout=10
@@ -190,7 +198,7 @@ def create_keycloak_user(username, password, email, domain, port):
         if not super_admin:
             return {"success": False, "message": "super-admin role not found"}
 
-        # Assign super-admin role in supos realm
+        # Assign super-admin to user in supos realm
         assign_resp = requests.post(
             f"{keycloak_url}/admin/realms/supos/users/{supos_user_id}/role-mappings/clients/{supos_client_uuid}",
             headers=headers,
@@ -200,7 +208,7 @@ def create_keycloak_user(username, password, email, domain, port):
         if assign_resp.status_code not in [204, 200]:
             return {"success": False, "message": f"Supos role assignment failed: {assign_resp.status_code}"}
 
-        # Create user in master realm
+        # === MASTER REALM ===
         master_resp = requests.post(
             f"{keycloak_url}/admin/realms/master/users",
             headers=headers,
@@ -243,7 +251,7 @@ def create_keycloak_user(username, password, email, domain, port):
         if not admin_role or not default_roles:
             return {"success": False, "message": "Master roles not found"}
 
-        # Assign admin + default-roles-master in master realm
+        # Assign admin + default-roles-master
         master_assign = requests.post(
             f"{keycloak_url}/admin/realms/master/users/{master_user_id}/role-mappings/realm",
             headers=headers,
@@ -257,9 +265,40 @@ def create_keycloak_user(username, password, email, domain, port):
         if master_assign.status_code not in [204, 200]:
             return {"success": False, "message": f"Master role assignment failed: {master_assign.status_code}"}
 
+        # === DELETE DEFAULTS (COMMENTED OUT - BUG PREVENTION) ===
+        # Uncomment when bugs fixed
+
+        # Delete default supos user
+        # default_supos = requests.get(
+        #     f"{keycloak_url}/admin/realms/supos/users?username=supos&exact=true",
+        #     headers=headers, timeout=10
+        # )
+        # if default_supos.status_code == 200:
+        #     for user in default_supos.json():
+        #         if user['username'] == 'supos':
+        #             requests.delete(
+        #                 f"{keycloak_url}/admin/realms/supos/users/{user['id']}",
+        #                 headers=headers, timeout=10
+        #             )
+        #             break
+
+        # Delete default admin user
+        # default_admin = requests.get(
+        #     f"{keycloak_url}/admin/realms/master/users?username=admin&exact=true",
+        #     headers=headers, timeout=10
+        # )
+        # if default_admin.status_code == 200:
+        #     for user in default_admin.json():
+        #         if user['username'] == 'admin':
+        #             requests.delete(
+        #                 f"{keycloak_url}/admin/realms/master/users/{user['id']}",
+        #                 headers=headers, timeout=10
+        #             )
+        #             break
+
         return {
             "success": True,
-            "message": f"✓ User {username} created in both realms with proper roles"
+            "message": f"✓ User {username} created in both realms with super-admin role"
         }
 
     except requests.exceptions.RequestException as e:
@@ -268,13 +307,12 @@ def create_keycloak_user(username, password, email, domain, port):
         return {"success": False, "message": f"Error: {str(e)}"}
 
 def configure_supos_client_callback(domain, port=8088):
-    """Configure supos client in supos realm with orchestrator callback - EXACT original"""
+    """Configure supos client callback URLs"""
     keycloak_url = "http://172.17.0.1:8081"
     orchestrator_callback = f"http://{domain}:8080/auth/callback"
     supos_callback = f"http://{domain}:{port}/inter-api/supos/auth/token"
 
     try:
-        # Get admin token
         token_resp = requests.post(
             f"{keycloak_url}/realms/master/protocol/openid-connect/token",
             data={
@@ -295,7 +333,6 @@ def configure_supos_client_callback(domain, port=8088):
             "Content-Type": "application/json"
         }
 
-        # Find supos client in supos realm
         clients_resp = requests.get(
             f"{keycloak_url}/admin/realms/supos/clients?clientId=supos",
             headers=headers,
@@ -303,54 +340,29 @@ def configure_supos_client_callback(domain, port=8088):
         )
 
         if clients_resp.status_code != 200:
-            return {"success": False, "message": f"Client query failed: {clients_resp.text}"}
+            return {"success": False, "message": "Failed to get client"}
 
         clients = clients_resp.json()
         if not clients:
-            return {"success": False, "message": "supos client not found in supos realm"}
+            return {"success": False, "message": "Client not found"}
 
-        client_uuid = clients[0]["id"]
+        client_id = clients[0]["id"]
 
-        # Get current client config
-        config_resp = requests.get(
-            f"{keycloak_url}/admin/realms/supos/clients/{client_uuid}",
-            headers=headers,
-            timeout=10
-        )
-
-        if config_resp.status_code != 200:
-            return {"success": False, "message": f"Config fetch failed: {config_resp.text}"}
-
-        client_config = config_resp.json()
-
-        # Update redirect URIs
-        redirect_uris = client_config.get("redirectUris", [])
-        new_uris = [
-            orchestrator_callback,
-            f"http://{domain}:8080/*",
-            supos_callback,
-            f"http://{domain}:{port}/*"
-        ]
-
-        for uri in new_uris:
-            if uri not in redirect_uris:
-                redirect_uris.append(uri)
-
-        client_config["redirectUris"] = redirect_uris
-
-        # Update client
         update_resp = requests.put(
-            f"{keycloak_url}/admin/realms/supos/clients/{client_uuid}",
+            f"{keycloak_url}/admin/realms/supos/clients/{client_id}",
             headers=headers,
-            json=client_config,
+            json={
+                **clients[0],
+                "redirectUris": [orchestrator_callback, supos_callback, f"http://{domain}:{port}/*"],
+                "webOrigins": [f"http://{domain}:8080", f"http://{domain}:{port}"]
+            },
             timeout=10
         )
 
-        if update_resp.status_code not in [200, 204]:
-            return {"success": False, "message": f"Update failed: {update_resp.status_code} - {update_resp.text}"}
+        if update_resp.status_code not in [204, 200]:
+            return {"success": False, "message": f"Update failed: {update_resp.status_code}"}
 
-        return {"success": True, "message": f"✓ supos client configured: {orchestrator_callback}, {supos_callback}"}
+        return {"success": True, "message": "Callbacks configured"}
 
     except Exception as e:
-        import traceback
-        return {"success": False, "message": f"Exception: {traceback.format_exc()}"}
+        return {"success": False, "message": str(e)}

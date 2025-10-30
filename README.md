@@ -30,6 +30,14 @@ Then access through web browser: http://YOUR_SERVER_IP:8080
 - 4GB RAM minimum
 - Ports 8080 and 8088 available
 
+## What it does
+
+- **Setup wizard** → Zero terminal config, admin created via UI
+- **Modular apps** → Install Grafana, MinIO, ELK post-deployment
+- **Integrated app store** → Add capabilities without reinstall
+- **One-click updates** → Version management from UI
+- **Automated backups** → Database exports + config snapshots
+
 ### v0.1 Roadmap (Hackathon Submission)
 
 - [x] Single Docker command to run on both amd64 & arm64
@@ -47,13 +55,3 @@ Then access through web browser: http://YOUR_SERVER_IP:8080
 
 - [ ] Fix Bugs in GitHub Issue
   - [ ] Implement proper disable/block for default admin, necessary for security.
-
-## What it does
-
-- **Setup wizard** → Zero terminal config, admin created via UI
-- **Modular apps** → Install Grafana, MinIO, ELK post-deployment
-- **Integrated app store** → Add capabilities without reinstall
-- **One-click updates** → Version management from UI
-- **Automated backups** → Database exports + config snapshots
-
-**Philosophy:** Nextcloud did it for file sharing. We're doing it for industrial data.

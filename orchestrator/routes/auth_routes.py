@@ -65,6 +65,10 @@ def auth_callback():
         if userinfo_resp.status_code == 200:
             user = userinfo_resp.json()
 
+            # Clear stale session
+            session.clear()
+
+            # Atomic session setup
             session.permanent = True
             session['keycloak_user'] = user.get('preferred_username', 'admin')
             session['access_token'] = token_data.get('access_token')
@@ -73,9 +77,24 @@ def auth_callback():
                 datetime.utcnow() + timedelta(seconds=token_data.get('expires_in', 300))
             ).isoformat()
             session['session_created_at'] = datetime.utcnow().isoformat()
+            session['auth_verified'] = True
             session.modified = True
 
-            return redirect('/')
+            # Create response with HTML - Flask auto-sets session cookie
+            from flask import make_response
+            html = '''<!DOCTYPE html>
+            <html><head><title>Redirecting...</title></head>
+            <body>
+                <p>Login successful. Redirecting...</p>
+                <script>
+                    setTimeout(() => { window.location.href = '/'; }, 800);
+                </script>
+            </body>
+            </html>'''
+
+            response = make_response(html, 200)
+            response.headers['Content-Type'] = 'text/html'
+            return response
 
         return jsonify({'error': 'User info failed'}), 400
 
@@ -98,4 +117,18 @@ def auth_status():
         'user': session.get('keycloak_user'),
         'setup_complete': is_setup_complete(),
         'token_expires_at': session.get('token_expires_at')
+    })
+
+@auth_routes_bp.route('/api/auth/session-check')
+def session_check():
+    """Lightweight session verification - no token validation"""
+    has_session = bool(
+        session.get('auth_verified') and
+        session.get('access_token') and
+        session.get('keycloak_user')
+    )
+
+    return jsonify({
+        'session_established': has_session,
+        'user': session.get('keycloak_user') if has_session else None
     })
