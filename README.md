@@ -58,6 +58,10 @@ Then access through web browser: http://YOUR_SERVER_IP:8080
   - [ ] Implement proper disable/block for default admin, necessary for security.
 - [ ] Full-featured Backup/Restore
   - [ ] Backup system/containers config
+- [ ] supOS-bedrock container update
+- [ ] Establish standards
+  - [ ] APIs
+  - [ ] Set of files needed for each containers
 - [ ] Implement within supOS-frontend
   - [ ] Show update notifications through APIs
   - [ ] Access orchestrator through homepage menu
