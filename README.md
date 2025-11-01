@@ -1,4 +1,6 @@
-# supOS-bedrock: Open Foundation for Industrial Platforms
+# supOS-bedrock: Open Foundation for Industrial Tools
+
+One-command installation for supOS ecosystem with web-based orchestration.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Status](https://img.shields.io/badge/status-development-yellow.svg)]()
@@ -9,7 +11,13 @@
 > [!important]
 > This is a drop-in reimagining of [supOS-CE](https://github.com/FREEZONEX/supOS-CE).
 
-Think [Nextcloud AIO](https://github.com/nextcloud/all-in-one) for industrial systems—install the core, choose your apps.
+## The Problem
+
+Industry suffers from "data spaghetti"—legacy systems don't fit Industry 4.0 standards. Unified Namespace offers solutions through open tools, but fragmented deployment creates friction. Industry won't adopt scattered services that need separate maintenance.
+
+**Why platforms win:** Linux and Nextcloud succeeded as foundations where apps live together. Complexity managed once, not per service.
+
+**This project:** Makes supOS installation work like [Nextcloud All-in-One](https://github.com/nextcloud/all-in-one). Single command installs core, web UI manages lifecycle.
 
 ## Quick Start
 ```bash
@@ -23,7 +31,7 @@ docker run -d \
   leekaize/supos-bedrock:latest
 ```
 
-Then access through web browser: http://YOUR_SERVER_IP:8080
+Then access through web browser: `http://YOUR_SERVER_IP:8080`
 
 ### Requirements
 - Docker 20.10+
@@ -65,3 +73,56 @@ Then access through web browser: http://YOUR_SERVER_IP:8080
 - [ ] Implement within supOS-frontend
   - [ ] Show update notifications through APIs
   - [ ] Access orchestrator through homepage menu
+
+## Architecture
+
+**What supOS-bedrock adds on top of supOS-CE:**
+
+**Orchestrator Layer (New):**
+- Docker-in-Docker: Mounts `/var/run/docker.sock` to control host Docker daemon
+- Flask backend (Python 3.12): Generates dynamic Compose commands, streams installation logs via polling API
+- React frontend (Node.js 20): Setup wizard, container management UI, version comparison
+- Multi-stage build: Compiles React to static assets, embeds workspace (scripts, compose files, configs)
+
+**Installation Workflow (Replaces manual steps):**
+- Automated system checks: Volume paths, port availability, IP detection
+- Dynamic profile selection: `--profile grafana`, `--profile minio`, `--profile elk` generated based on UI selections
+- Non-interactive mode: `bin/install.sh --non-interactive` called by orchestrator with pre-configured `.env`
+- Real-time log streaming: Frontend polls `/api/install/logs` every 2 seconds during installation
+
+**Version Management (New):**
+- `builds.yaml` manifest: Defines recommended versions for each service
+- GitHub integration: Orchestrator fetches manifest on startup
+- Update detection: Compares running container versions against manifest, surfaces in UI
+- One-click updates: Executes `docker compose pull` + `up -d` for selected services
+
+**Backup System (New):**
+- Borg Backup integration: Incremental snapshots with compression
+- Configurable paths: UI-driven backup directory selection
+- Restore capability: Point-in-time recovery from snapshots
+
+## Development
+
+> [!important]
+> Recommended to use or refer to automated tasks in `.vscode/`.
+
+Run orchestrator locally:
+```bash
+cd orchestrator
+pip install -r requirements.txt
+cd frontend && npm install && npm run build && cd ..
+python app.py
+# Access http://localhost:8080
+```
+
+Build image:
+```bash
+docker build -t supos-bedrock:dev .
+```
+
+**Key files:**
+- `orchestrator/routes/installation.py` - Installation workflow, log streaming
+- `orchestrator/routes/containers.py` - Container management, updates
+- `builds.yaml` - Version manifest
+- `bin/install.sh` - Core installation (now supports `--non-interactive`)
+- `docker-compose-xxxx.yml` - Service definitions with profiles
